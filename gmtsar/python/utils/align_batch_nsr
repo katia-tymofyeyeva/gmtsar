@@ -1,0 +1,113 @@
+#! /usr/bin/env python3
+"""align_batch_nsr — align a stack of NISAR SLCs to a common master.
+
+NISAR-batch counterpart to `align_batch`. Deliberately NOT a thin wrapper
+around align_batch: align_batch's alignment method (calc_dop_orb + DEM-based
+SAT_llt2rat ray-tracing + a 3rd-order polynomial fit) is a different
+algorithm from the one NISAR is actually validated against. The proven
+NISAR alignment method — exercised end-to-end via the single-pair
+`p2p_processing NSR_A`/`NSR_B` path (see utils/p2p_stages.py:
+P2P2FocusAlign's NSR branch, `_xcorr_and_fitoffset`, `_resamp_and_swap`) —
+is pure amplitude cross-correlation against the master (no DEM involved at
+this stage) followed by a 10th-order 2D polynomial warp. This script applies
+that exact per-pair recipe in a loop against one master, the same way
+align_batch generalizes align.csh to a stack for other sensors.
+
+Run from the top-level case directory (same convention as align_batch);
+creates / populates SLC/. Expects a data.in of already-preprocessed
+NSR_<date><band> stems — i.e. raw/stem_data.in as written by
+pre_proc_batch_nsr, or an equivalent hand-built file in the same format
+(line 1 = master stem, line 2+ = repeat stems).
+
+Usage:  align_batch_nsr data.in
+"""
+import os
+import sys
+
+from gmtsar_lib import run
+
+
+def _stage_slc_inputs(name):
+    """cp PRM, symlink SLC + LED from ../raw/ into SLC/ — mirrors
+    p2p_stages.py's _stage_slc_inputs(name, sat_uses_raw=False): NISAR
+    RSLC is already-focused SLC, not RAW, so there's no sarp focusing step."""
+    run(f"cp ../raw/{name}.PRM .")
+    run(f"ln -sf ../raw/{name}.SLC .")
+    run(f"ln -sf ../raw/{name}.LED .")
+
+
+def _align_one(master, aligned):
+    """One aligned image vs. the master. Mirrors p2p_stages.py's
+    P2P2FocusAlign NSR branch verbatim: SAT_baseline_py -> amp-based
+    xcorr_py (40x40 grid) -> fitoffset_ra (10,10 polynomial, produces
+    r.grd/a.grd) -> resamp_py factor 5 using those grids.
+
+    Note: `slc2amp {master}.PRM 4 amp-{master}.grd` only depends on the
+    master, not on `aligned` — it's recomputed every iteration here purely
+    to stay verbatim with the proven single-pair recipe (which always
+    recomputes it fresh, having no batch context). Hoisting it out of the
+    loop is a safe-looking speed optimization but hasn't been validated
+    against real multi-scene data yet — leave it as-is until a real stack
+    run confirms parity, per this fork's "verbatim first, optimize only
+    after parity is proven" convention (project_rules.md Rule 7)."""
+    _stage_slc_inputs(aligned)
+
+    run(f"cp {aligned}.PRM {aligned}.PRM0")
+    run(f"SAT_baseline_py {master}.PRM {aligned}.PRM0 >> {aligned}.PRM")
+
+    run("rm -f amp*.grd")
+    run(f"slc2amp {master}.PRM 4 amp-{master}.grd")
+    run(f"xcorr_py {master}.PRM {aligned}.PRM -xsearch 128 -ysearch 128 -nx 40 -ny 40")
+    run("fitoffset_ra 10 10 freq_xcorr.dat 20")
+
+    run(f"resamp_py {master}.PRM {aligned}.PRM {aligned}.PRMresamp {aligned}.SLCresamp 5 r.grd a.grd")
+    run(f"rm -f {aligned}.SLC")
+    run(f"mv {aligned}.SLCresamp {aligned}.SLC")
+    run(f"cp {aligned}.PRMresamp {aligned}.PRM")
+
+
+def align_batch_nsr():
+    if len(sys.argv) != 2:
+        sys.exit(
+            "Usage: align_batch_nsr data.in\n"
+            "  data.in: line 1 = master stem (NSR_<date><band>), line 2+ = repeat stems\n"
+            "  (typically raw/stem_data.in, written by pre_proc_batch_nsr)\n"
+            "  Run from the top-level case directory."
+        )
+    data_in = sys.argv[1]
+    if not os.path.isfile(data_in):
+        sys.exit(f"no data.in file: {data_in}")
+
+    with open(data_in) as f:
+        names = [ln.strip() for ln in f if ln.strip()]
+    if len(names) < 2:
+        sys.exit("align_batch_nsr: need at least 1 master + 1 repeat in data.in")
+    master, repeats = names[0], names[1:]
+
+    for name in (master, *repeats):
+        for ext in ("PRM", "SLC", "LED"):
+            if not os.path.isfile(f"raw/{name}.{ext}"):
+                sys.exit(
+                    f"missing raw/{name}.{ext} — run pre_proc_batch_nsr first "
+                    f"(from raw/, on the same data.in used to derive {data_in})"
+                )
+
+    print("START ALIGN A STACK OF NISAR IMAGES\n")
+    os.makedirs("SLC", exist_ok=True)
+    run("cleanup SLC")
+    os.chdir("SLC")
+
+    _stage_slc_inputs(master)
+
+    n = len(repeats)
+    for i, aligned in enumerate(repeats, start=1):
+        print(f"working on {aligned}  [ {i} / {n} ]")
+        _align_one(master, aligned)
+
+    run("rm -f *.PRM0 *resamp amp*.grd freq_xcorr.dat r.grd a.grd")
+    os.chdir("..")
+    print("\nEND ALIGN A STACK OF NISAR IMAGES")
+
+
+if __name__ == "__main__":
+    align_batch_nsr()

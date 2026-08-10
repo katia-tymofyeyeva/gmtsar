@@ -8,7 +8,7 @@ sharing topo_ra across pairs.
 
 Usage:  intf_batch SAT intf.in batch.config
 
-Supported SATs: ALOS, ENVI, ENVI_SLC, ERS, TSX
+Supported SATs: ALOS, ENVI, ENVI_SLC, ERS, TSX, NSR_A, NSR_B
 """
 import os
 import subprocess
@@ -17,7 +17,7 @@ import sys
 from gmtsar_lib import run, grep_value, check_file_report
 
 
-_SUPPORTED_SATS = {"ALOS", "ENVI", "ERS", "ENVI_SLC", "TSX"}
+_SUPPORTED_SATS = {"ALOS", "ENVI", "ERS", "ENVI_SLC", "TSX", "NSR_A", "NSR_B"}
 
 
 def _get_config(path, key, default=""):
@@ -71,6 +71,16 @@ def _topo_stage(master, SAT, topo_phase, shift_topo):
         run(f"slc2amp {master}.PRM {rng} amp-{master}.grd")
     elif SAT in ("ERS", "ENVI", "ENVI_SLC"):
         run(f"slc2amp {master}.PRM 1 amp-{master}.grd")
+    elif SAT in ("NSR_A", "NSR_B"):
+        # No fixed decimation factor for NISAR — derive it from topo_ra.grd's
+        # own x_inc, exactly as p2p_stages.py's _offset_topo_shift does (the
+        # proven single-pair NSR path for this same step).
+        run("gmt grdinfo ../topo/topo_ra.grd > tmp.txt")
+        rng = grep_value("tmp.txt", "x_inc", 7)
+        run(f"slc2amp {master}.PRM {rng} amp-{master}.grd")
+        run("rm -f tmp.txt")
+    else:
+        sys.exit(f"OFFSET_TOPO: no amp-generation rule wired for SAT {SAT!r}")
     os.chdir("../topo")
     run(f"ln -sf ../SLC/amp-{master}.grd .")
     run(f"offset_topo amp-{master}.grd topo_ra.grd 0 0 7 topo_shift.grd")
@@ -143,7 +153,7 @@ def intf_batch():
     if len(sys.argv) != 4:
         sys.exit(
             "Usage: intf_batch SAT intf.in batch.config\n"
-            "  SAT: ALOS / ENVI / ENVI_SLC / ERS / TSX\n"
+            "  SAT: ALOS / ENVI / ENVI_SLC / ERS / TSX / NSR_A / NSR_B\n"
             "  intf.in: one 'ref:rep' per line"
         )
     SAT, intf_in, config = sys.argv[1], sys.argv[2], sys.argv[3]

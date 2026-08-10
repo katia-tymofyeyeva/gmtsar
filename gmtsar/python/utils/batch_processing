@@ -8,8 +8,8 @@ Steps 3 (back-geocoding) and 5 (unwrap-only) are TODO — see notes below.
 Usage:  batch_processing SAT master_image inputfile step [config]
 
 step:
-  1 = preprocessing                 → pre_proc_batch
-  2 = alignment                     → align_batch
+  1 = preprocessing                 → pre_proc_batch (pre_proc_batch_nsr for NSR_A/NSR_B)
+  2 = alignment                     → align_batch (align_batch_nsr for NSR_A/NSR_B)
   3 = back-geocoding                  TODO (inline dem2topo_ra + offset_topo)
   4 = interferometry                → intf_batch (stage 2 only)
   5 = phase unwrapping                TODO (intf_batch with stage=5 semantics)
@@ -21,6 +21,15 @@ Notes:
     Python version preserves the same convention via pre_proc_batch.
   - For multi-subswath data, run merging steps externally before
     unwrap/geocode (same as csh).
+  - NSR_A / NSR_B (NISAR): inputfile for steps 1-2 is a data.in of raw
+    granule basenames (no .h5), master first — same shape as every other
+    SAT's data.in. pre_proc_batch_nsr always preprocesses both NISAR
+    frequency bands per granule but only baselines/tracks the one named by
+    the SAT suffix (A or B). Step 1 must run before step 2 (it produces
+    raw/stem_data.in, which step 2 consumes). Before step 4, set
+    master_image in config.py to the DERIVED stem
+    (e.g. NSR_20251122A) printed by step 1 — not the raw granule name —
+    same requirement intf_batch already has for every other SAT.
 """
 import os
 import sys
@@ -31,7 +40,7 @@ from gmtsar_lib import run
 _SUPPORTED_SATS = {
     "ERS", "ENVI", "ALOS", "ALOS_SLC", "ALOS2", "ALOS2_SCAN",
     "S1_STRIP", "S1_TOPS", "ENVI_SLC", "CSK_RAW", "CSK_SLC",
-    "TSX", "RS2", "GF3", "LT1",
+    "TSX", "RS2", "GF3", "LT1", "NSR_A", "NSR_B",
 }
 
 
@@ -61,16 +70,38 @@ def batch_processing():
         run(f"pop_config {SAT} > config.{SAT}.txt")
         config = f"config.{SAT}.txt"
 
+    # Resolve to absolute paths before any step chdir's (pre_proc_batch_nsr
+    # must run from raw/, everything else runs from the case root) — makes
+    # every step's file args valid regardless of cwd at call time.
+    inputfile = os.path.abspath(inputfile)
+    config = os.path.abspath(config)
+
     if step == 1:
         print(f"batch_processing: step 1 — preprocessing")
-        run(f"pre_proc_batch {SAT} {inputfile} {config}")
+        if SAT in ("NSR_A", "NSR_B"):
+            band = SAT[-1]  # "A" or "B"
+            if not os.path.isdir("raw"):
+                sys.exit("[ERROR]: raw/ directory not found — expected NISAR "
+                         ".h5 granules there")
+            os.chdir("raw")
+            run(f"pre_proc_batch_nsr {inputfile} {config} {band}")
+            os.chdir("..")
+        else:
+            run(f"pre_proc_batch {SAT} {inputfile} {config}")
     elif step == 2:
         print(f"batch_processing: step 2 — alignment")
-        # data_type = RAW for SAR raw inputs, SLC for already-focused.
-        # ALOS/ERS/ENVI/ENVI_SCAN are RAW; SLC and *_SLC variants are SLC.
-        data_type = "RAW" if SAT in ("ALOS", "ERS", "ENVI") else "SLC"
-        secondary = "1"  # legacy default
-        run(f"align_batch {data_type} {secondary} {inputfile}")
+        if SAT in ("NSR_A", "NSR_B"):
+            stem_data_in = os.path.join("raw", "stem_data.in")
+            if not os.path.isfile(stem_data_in):
+                sys.exit(f"[ERROR]: {stem_data_in} not found — run step 1 "
+                         f"(preprocessing) first")
+            run(f"align_batch_nsr {stem_data_in}")
+        else:
+            # data_type = RAW for SAR raw inputs, SLC for already-focused.
+            # ALOS/ERS/ENVI/ENVI_SCAN are RAW; SLC and *_SLC variants are SLC.
+            data_type = "RAW" if SAT in ("ALOS", "ERS", "ENVI") else "SLC"
+            secondary = "1"  # legacy default
+            run(f"align_batch {data_type} {secondary} {inputfile}")
     elif step == 4:
         print(f"batch_processing: step 4 — interferometry")
         run(f"intf_batch {SAT} {inputfile} {config}")

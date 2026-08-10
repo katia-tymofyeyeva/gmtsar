@@ -1,5 +1,58 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-08-09: NISAR batch/stack processing — `pre_proc_batch_nsr`, `align_batch_nsr`
+
+**Prototype, NOT yet validated against a real 3+ scene stack** (per Rule 13,
+recorded here as its own state rather than folded into "done"). Before this,
+NISAR only had the single-pair path: `p2p_processing NSR_A`/`NSR_B` +
+`pre_proc_nsr`, proven end-to-end on the real 2-scene `NISAR_Ethiopia` case
+(see the "Attempted 2026-07-12: SAR sensor preprocessors" entry below).
+`pre_proc_batch`/`intf_batch`'s own `_SUPPORTED_SATS` explicitly excluded
+NSR — there was no way to align/interferogram more than one pair.
+
+Two new scripts (`gmtsar/python/utils/pre_proc_batch_nsr`,
+`.../align_batch_nsr`) generalize the proven single-pair recipe to a stack,
+verbatim — they do NOT reuse generic `align_batch`'s algorithm (DEM-based
+`SAT_llt2rat` ray-tracing + 3rd-order fit), because that's not what NISAR's
+validated path actually does. Instead they replay
+`p2p_stages.py`'s exact NSR branch (`P2P2FocusAlign`, `_xcorr_and_fitoffset`,
+`_resamp_and_swap`: amp-based `xcorr_py` 40×40 grid + `fitoffset_ra`
+10,10-order polynomial → `r.grd`/`a.grd` → `resamp_py` factor 5) in a loop
+against one master. `baseline_table` and `select_pairs` needed no changes —
+both were already NISAR-aware (baseline_table's SC_identity==5/year>=2013
+epoch branch predates this work). `intf_batch` gained an NSR branch in its
+OFFSET_TOPO step (dynamic decimation via `topo_ra.grd`'s x_inc, mirroring
+`p2p_stages._offset_topo_shift`, since NISAR has no fixed decimation
+constant the way ALOS/TSX do) plus a fail-loud `else` for any future SAT
+that hits that branch with no rule — a latent Rule-1 gap in the pre-existing
+code, fixed as a side effect. `batch_processing`'s dispatcher now routes
+step 1/2 to the NSR scripts for `SAT in (NSR_A, NSR_B)`.
+
+**What's real vs. unverified:**
+- Every individual command in the alignment loop (`SAT_baseline_py`,
+  `slc2amp`, `xcorr_py`, `fitoffset_ra`, `resamp_py`) is the exact command
+  the proven single-pair path already runs — not reimplemented, only
+  looped. `pre_proc_nsr` itself is unchanged (already wired ON,
+  byte-identical to C, see below).
+- **Not yet run end-to-end against real data.** All Python files
+  `py_compile` clean; no case in `tests/cases.py` currently exercises a
+  3+ scene NISAR stack (`NISAR_Ethiopia` is 2 scenes = 1 pair, which
+  doesn't exercise the *batch* loop logic — a master + exactly one repeat
+  is a degenerate stack). The user has additional NISAR granules on
+  another machine; a real run there is the next step, not yet done here.
+- One unvalidated-but-flagged micro-optimization opportunity: `align_batch_nsr`
+  recomputes `amp-<master>.grd` on every loop iteration (verbatim with the
+  single-pair recipe, which has no batch context to reuse it across calls).
+  Safe-looking, not hoisted out of the loop until a real stack run confirms
+  parity — see the comment in `_align_one`.
+
+**TODO before this can be called "wired ON" per Rule 13:** a real
+multi-scene NISAR run (ideally added as a new `tests/cases.py` fixture
+distinct from `NISAR_Ethiopia`, since that tarball only has 2 scenes),
+a parity/regression test per Rule 8, and a `master_image` auto-population
+step in `pop_config`/`pre_proc_batch_nsr` so the manual "set master_image
+to the derived stem before step 4" requirement isn't a footgun.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no

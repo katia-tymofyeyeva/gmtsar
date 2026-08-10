@@ -1,0 +1,155 @@
+#! /usr/bin/env python3
+"""pre_proc_batch_nsr — preprocess a stack of NISAR RSLC granules against a
+common master.
+
+NISAR-batch counterpart to `pre_proc_batch`, which explicitly excludes NSR
+(see its `_SUPPORTED_SATS`). Unlike ALOS/ERS/ENVI/TSX, NISAR granules don't
+need a near_range/earth_radius/fd1 handshake between master and repeat scenes
+— each call to `pre_proc_nsr` is self-contained (it runs calc_dop_orb
+internally, per scene). So this script's job is just to:
+
+  1. Loop `pre_proc_nsr` over every granule in data.in for the chosen
+     frequency band (A or B — NISAR RSLC products carry both; A is the
+     primary science band and the default here).
+  2. Build baseline_table.dat / table.gmt across the resulting scenes,
+     exactly as pre_proc_batch does for the other sensors (baseline_table
+     is already NISAR-aware — see its SC_identity==5, year>=2013 branch).
+  3. Write stem_data.in — the master-then-repeats list of DERIVED stem
+     names (NSR_<date><band>), which is what align_batch_nsr and the rest
+     of the pipeline key off, not the raw granule filenames.
+
+Each granule's derived stem is `NSR_` + the 8 characters starting at
+1-based position 44 of the granule filename (Python slice [43:51]) + the
+band letter — the same derivation pre_proc_nsr and p2p_stages.py's
+renameMasterAlignedForNSR already do independently; duplicated here rather
+than factored into gmtsar_lib.py to match how those two already duplicate
+it rather than share a helper.
+
+Run from the case's raw/ directory (same convention as pre_proc_batch and
+pre_proc_nsr — NOT the case root; align_batch_nsr, by contrast, runs from
+the case root, matching align_batch's convention).
+
+Usage:  pre_proc_batch_nsr data.in config.py [band]
+  data.in: line 1 = master granule basename (no .h5), line 2+ = repeat
+           granule basenames — bare filenames, resolved against cwd (raw/).
+  config.py: must contain SLC_factor and region_cut (consumed by
+             pre_proc_nsr for each granule).
+  band: A or B (default A) — which NISAR frequency sub-band to carry
+        through the batch. pre_proc_nsr always produces both bands per
+        granule; this script only baselines/tracks the one requested.
+
+Output (written into cwd, i.e. raw/):
+  NSR_<date><band>.{PRM,SLC,LED} for every granule (both master and repeats)
+  baseline_table.dat, table.gmt, stacktable_all.pdf
+  stem_data.in — derived stems, master first, for align_batch_nsr
+"""
+import os
+import subprocess
+import sys
+
+from gmtsar_lib import run
+
+
+def _nsr_stem(h5_basename, band):
+    """NSR_<YYYYMMDD><band> — mirrors pre_proc_nsr's own stem derivation
+    and p2p_stages.renameMasterAlignedForNSR."""
+    return f"NSR_{h5_basename[43:51]}{band}"
+
+
+def _baseline_pair(master_prm, aligned_prm, dat_file, gmt_file, append):
+    redir = ">>" if append else ">"
+    run(f"baseline_table {master_prm} {aligned_prm} {redir} {dat_file}")
+    run(f"baseline_table {master_prm} {aligned_prm} GMT {redir} {gmt_file}")
+
+
+def _plot_baseline():
+    """Plot baseline_table.dat -> stacktable_all.pdf. Uses the NISAR-era
+    2014 epoch offset for the x-axis, matching baseline_table's own
+    SC_identity==5/year>=2013 branch and select_pairs' NISAR-era default
+    (both already assume this epoch for NSR data) — mirrors
+    pre_proc_batch._plot_baseline's per-SAT epoch_expr table, just with
+    NSR's epoch instead of looking one up by SAT name."""
+    run("awk '{print 2014 + $3/365.25, $4, $1}' < table.gmt > text")
+    region_raw = subprocess.run(
+        ["gmt", "gmtinfo", "text", "-C"], check=False, stdout=subprocess.PIPE
+    ).stdout.decode("utf-8").split()
+    if len(region_raw) >= 4:
+        x0, x1, y0, y1 = (
+            float(region_raw[0]) - 0.5, float(region_raw[1]) + 0.5,
+            float(region_raw[2]) - 50, float(region_raw[3]) + 50,
+        )
+        R = f"-R{x0}/{x1}/{y0}/{y1}"
+    else:
+        R = "-R0/1/-1000/1000"
+    run(f"gmt pstext text -JX8.8i/6.8i {R} -D0.2/0.2 -X1.5i -Y1i "
+        f"-K -N -F+f8,Helvetica+j5 > stacktable_all.ps")
+    run("awk '{print $1,$2}' < text > text2")
+    run(f"gmt psxy text2 -Sp0.2c -G0 -R -JX "
+        f"-Ba1:\"year\":/a50g00f25:\"baseline (m)\":WSen -O >> stacktable_all.ps")
+    run("gmt psconvert stacktable_all.ps -Tf -A")
+    run("rm -f text text2 stacktable_all.ps")
+
+
+def pre_proc_batch_nsr():
+    argv = sys.argv
+    if len(argv) not in (3, 4):
+        sys.exit(
+            "Usage: pre_proc_batch_nsr data.in config.py [band]\n"
+            "  data.in: line 1 = master granule (no .h5), line 2+ = repeat granules\n"
+            "  band: A or B (default A)\n"
+            "  Run from the case's raw/ directory."
+        )
+    data_in, config = argv[1], argv[2]
+    band = argv[3] if len(argv) == 4 else "A"
+    if band not in ("A", "B"):
+        sys.exit(f"band must be A or B, got {band!r}")
+    if not os.path.isfile(config):
+        sys.exit(f"no config file: {config}")
+    if not os.path.isfile(data_in):
+        sys.exit(f"no data.in file: {data_in}")
+
+    with open(data_in) as f:
+        names = [ln.strip() for ln in f if ln.strip()]
+    if len(names) < 2:
+        sys.exit("pre_proc_batch_nsr: need at least 1 master + 1 repeat in data.in")
+
+    master_name = names[0].split()[0]
+    repeat_names = [ln.split()[0] for ln in names[1:]]
+
+    print(f"band {band}\nSTART PREPROCESS A STACK OF NISAR IMAGES\n")
+
+    print(f"preprocess master granule {master_name}")
+    if not os.path.isfile(f"{master_name}.h5"):
+        sys.exit(f"missing input: {master_name}.h5 (expected in cwd — run from raw/)")
+    run(f"pre_proc_nsr {master_name}.h5 {config}")
+    master_stem = _nsr_stem(master_name, band)
+    if not os.path.isfile(f"{master_stem}.PRM"):
+        sys.exit(f"pre_proc_nsr did not produce {master_stem}.PRM — check the log above")
+    _baseline_pair(f"{master_stem}.PRM", f"{master_stem}.PRM",
+                   "baseline_table.dat", "table.gmt", append=False)
+
+    stems = [master_stem]
+    for repeat_name in repeat_names:
+        print(f"preprocess repeat granule {repeat_name}")
+        if not os.path.isfile(f"{repeat_name}.h5"):
+            sys.exit(f"missing input: {repeat_name}.h5 (expected in cwd — run from raw/)")
+        run(f"pre_proc_nsr {repeat_name}.h5 {config}")
+        repeat_stem = _nsr_stem(repeat_name, band)
+        if not os.path.isfile(f"{repeat_stem}.PRM"):
+            sys.exit(f"pre_proc_nsr did not produce {repeat_stem}.PRM — check the log above")
+        _baseline_pair(f"{master_stem}.PRM", f"{repeat_stem}.PRM",
+                       "baseline_table.dat", "table.gmt", append=True)
+        stems.append(repeat_stem)
+
+    _plot_baseline()
+
+    with open("stem_data.in", "w") as f:
+        for stem in stems:
+            f.write(stem + "\n")
+
+    print(f"\nwrote stem_data.in ({len(stems)} scenes, band {band}) and baseline_table.dat")
+    print("END PREPROCESS A STACK OF NISAR IMAGES")
+
+
+if __name__ == "__main__":
+    pre_proc_batch_nsr()
