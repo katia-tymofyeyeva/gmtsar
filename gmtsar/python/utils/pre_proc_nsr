@@ -67,15 +67,37 @@ def _get_config(path, key, default=""):
 
 def _make_slc_nsr(h5_file, out_stem, mode, slc_factor, region_cut):
     """Dispatch to the in-process Python port or the C-binary subprocess,
-    per GMTSAR_NSR_PREPROC_PY."""
+    per GMTSAR_NSR_PREPROC_PY.
+
+    region_cut == "-999" is pop_config's / p2p_processing's standard "not
+    set" sentinel (see pop_config's template: 'region_cut = -999' means
+    "process the full scene", same convention as earth_radius/near_range/
+    fd1). Found 2026-09-01: this function used to pass the sentinel
+    through unconditionally as a literal crop string on both dispatch
+    branches. Both make_slc_nsr_py.make_slc_nsr() (region_cut=None) and
+    the C binary (called with only 4 positional args, so argc==5 not 6)
+    already correctly handle "no crop" by expanding to the full scene
+    internally (write_slc_hdf5's xl==xh==yl==yh==0 check, C and Python
+    identical) -- the bug was only in never routing the sentinel to that
+    already-correct path. Passing the literal string "-999" through
+    instead makes it into get_range(), which tries to split it into 4
+    slash-separated ints and raises ValueError. Never caught by the
+    NISAR_Ethiopia parity test, which always sets a real region_cut in
+    its config -- only surfaced via pre_proc_batch_nsr with pop_config's
+    unedited default."""
+    no_crop = region_cut in (None, "", "-999")
     if _use_nsr_preproc_py():
         from make_slc_nsr_py import make_slc_nsr
 
         print(" ")
         print(f"make_slc_nsr_py {h5_file} {out_stem} {mode} {slc_factor} {region_cut}")
-        make_slc_nsr(h5_file, out_stem, mode, float(slc_factor), region_cut)
+        make_slc_nsr(h5_file, out_stem, mode, float(slc_factor),
+                     None if no_crop else region_cut)
     else:
-        run(f"make_slc_nsr {h5_file} {out_stem} {mode} {slc_factor} {region_cut}")
+        if no_crop:
+            run(f"make_slc_nsr {h5_file} {out_stem} {mode} {slc_factor}")
+        else:
+            run(f"make_slc_nsr {h5_file} {out_stem} {mode} {slc_factor} {region_cut}")
 
 
 def pre_proc_nsr():

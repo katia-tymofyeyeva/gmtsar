@@ -53,6 +53,27 @@ a parity/regression test per Rule 8, and a `master_image` auto-population
 step in `pop_config`/`pre_proc_batch_nsr` so the manual "set master_image
 to the derived stem before step 4" requirement isn't a footgun.
 
+**Real bug found 2026-09-01, via an actual remote run against real
+NISAR_CSAF data (not synthetic):** `pre_proc_nsr`'s `_make_slc_nsr()`
+passed `region_cut` through to `make_slc_nsr_py`/the C binary
+unconditionally, including the literal string `"-999"` — pop_config's
+own "not set" sentinel (same convention as `earth_radius`/`near_range`/
+`fd1`, see pop_config's template). Both `make_slc_nsr_py.make_slc_nsr()`
+(called with `region_cut=None`) and the C binary (called with only 4
+positional args) already correctly expand to the full scene internally
+when no crop is given — the bug was only in never routing the sentinel
+to that already-working path, so `get_range("-999", ...)` got called and
+raised (can't split "-999" into 4 slash-separated ints). **Never caught
+by the NISAR_Ethiopia parity test**, because that test's bundled config
+always sets a real `region_cut` — this is a real, exactly-Rule-9 case of
+"passing on synthetic/curated inputs isn't the same as passing on a real
+unedited default." Only surfaced because `pre_proc_batch_nsr` got run
+against pop_config's unedited output. Fixed in `pre_proc_nsr` (both
+dispatch branches now treat `region_cut in (None, "", "-999")` as "full
+scene"). **No regression test added yet** — this fork's `h5py`/real
+NISAR fixture isn't available in the environment that made this fix;
+flagging per Rule 8 rather than silently calling it done.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no
