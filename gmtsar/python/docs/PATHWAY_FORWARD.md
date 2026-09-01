@@ -74,6 +74,31 @@ scene"). **No regression test added yet** — this fork's `h5py`/real
 NISAR fixture isn't available in the environment that made this fix;
 flagging per Rule 8 rather than silently calling it done.
 
+**Second real bug found 2026-09-01, same remote NISAR_CSAF run, immediately
+after the fix above:** `pop_config` wrote its generated config directly to
+a hardcoded `./config.py` via `open('config.py', 'w')`, ignoring stdout
+entirely — not NSR-specific, affects every SAT. Every existing caller
+happened to redirect stdout to a file literally named `config.py` (this
+script's own usage docs say `pop_config SAT > config.py`;
+`tests/case_runner.py`'s `_stage_config` does the same), so it "worked"
+only by coincidence: the real content came from the internal write, and
+the shell's `>` redirect silently captured nothing. `batch_processing`'s
+own auto-generate-config step — used whenever the caller omits the
+trailing `[config]` argument, e.g. `batch_processing NSR_A <master>
+data.in 1` with no 5th arg — redirects to `config.<SAT>.txt` instead, a
+different filename, which exposed the bug: `config.<SAT>.txt` came out
+empty, and `_get_config()` (in `pre_proc_nsr`) read `""` for
+`SLC_factor`, crashing on `float('')`. Root-caused by tracing exactly
+where `batch_processing`'s auto-generated config filename diverges from
+`pop_config`'s hardcoded write target, then confirmed no other caller
+relied on the internal-write side effect. Fixed by having `pop_config`
+actually write to stdout (`sys.stdout.write(render(sat))`) instead of
+opening `config.py` itself — verified manually: `pop_config NSR_A >
+config.NSR_A.txt` now contains the real `SLC_factor`/`region_cut` values
+and no stray `config.py` is created. **No regression test added yet** —
+same environment gap as above (this fork's test harness needs a
+subprocess/stdout-capture check added to `tests/`, not yet written).
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no

@@ -121,14 +121,29 @@ def render(sat):
 
 
 def pop_config():
+    """Real bug found 2026-09-01, via an actual remote batch_processing run
+    (not synthetic): this used to write the generated config directly to a
+    hardcoded ./config.py via open()/f.write(), ignoring stdout entirely.
+    Every existing caller happened to redirect stdout to a file literally
+    named config.py (this script's own docs, tests/case_runner.py's
+    _stage_config), so it "worked" only by coincidence -- the real content
+    came from the internal write, and the shell's `>` redirect silently
+    captured nothing. batch_processing's own auto-generate-config step (used
+    whenever the caller omits the trailing [config] arg) redirects to
+    config.<SAT>.txt instead -- a different filename -- which exposed the
+    bug: config.<SAT>.txt came out empty, and callers reading it (e.g.
+    pre_proc_nsr's SLC_factor/region_cut lookup) got "" for everything.
+    Not NSR-specific -- affects any SAT run through batch_processing without
+    an explicit config argument. Fixed by actually writing to stdout, so
+    `>` redirection means what it says for any target filename."""
     if len(sys.argv) != 2:
         sys.exit(f"Usage: pop_config SAT  (one of: {', '.join(VALID_SATS)})")
     sat = sys.argv[1]
     if sat not in VALID_SATS:
         print(f"WARNING: unrecognized SAT {sat!r}; using base defaults", file=sys.stderr)
-    print(f"Generating config.py for {sat} ...", file=sys.stderr)
-    with open('config.py', 'w') as f:
-        f.write(render(sat))
+    print(f"Generating config for {sat} -- redirect stdout to save it "
+          f"(e.g. pop_config {sat} > config.py) ...", file=sys.stderr)
+    sys.stdout.write(render(sat))
 
 
 if __name__ == "__main__":
