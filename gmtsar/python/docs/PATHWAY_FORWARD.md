@@ -99,6 +99,39 @@ and no stray `config.py` is created. **No regression test added yet** —
 same environment gap as above (this fork's test harness needs a
 subprocess/stdout-capture check added to `tests/`, not yet written).
 
+**Memory blowup found 2026-09-02, same remote NISAR_CSAF run, once past the
+two bugs above:** `make_slc_nsr_py.py`'s `write_slc_hdf5()` was extremely
+memory-hungry writing out a full, uncropped scene (the normal case now that
+`region_cut = -999` is correctly honored as "full scene" rather than
+crashing). Root cause: it materialized the *entire* cropped region as a
+stack of full-size temporaries at once — complex64 region (8 B/px), float64
+real/imag copies (16 B/px), float32 real/imag (8 B/px),
+`f32_to_i16_batch`'s own internal finite/hi/lo/trunc/out temporaries
+(several more full-size float32/bool arrays), int16 outputs (4 B/px), and a
+final interleaved int16 array (4 B/px) duplicating the whole output right
+before the single `fp.write()` — many times the 4 B/px final output size,
+all held in RAM simultaneously, for a real NISAR scene's full extent.
+Fixed by chunking along rows: read/convert/quantize/write one horizontal
+stripe of the HDF5 dataset at a time (ordinary h5py slicing, which already
+only pulls the requested sub-region off disk) instead of the whole region
+in one shot. Column cropping (the multiple-of-4 width adjustment) is
+computed once up front exactly as before and applies unchanged to every
+stripe; only the row range is chunked. Diagnostic counters
+(sat_hi/sat_lo/zero_conv, sigma) are now accumulated across chunks as
+exact int64 sums instead of computed once over the full array — integer
+summation is associative, so this doesn't change the result. Default chunk
+size is 4096 rows (`_DEFAULT_ROWS_PER_CHUNK`), overridable via a new
+`rows_per_chunk` kwarg on `write_slc_hdf5()`. **Verified, not just
+reasoned through:** no h5py in the environment that made this fix, so
+tested with a standalone numpy-array stand-in for the h5py Dataset (slicing
+behavior is identical for this purpose) — chunked vs. single-shot produced
+byte-identical `.SLC` output and identical diagnostic counters across 7
+chunk sizes (1, 3, 4, 7, 16, 64, 1000 rows) against a synthetic scene sized
+to NOT be a multiple of any of them, including NaN/±Inf/saturating edge-case
+pixels to exercise every branch of `f32_to_i16_batch`. **Still flagged per
+Rule 8**: this is not the same as a real-HDF5-file regression test against
+actual NISAR data, which still needs h5py + a real fixture to add properly.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no

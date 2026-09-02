@@ -252,20 +252,55 @@ def f32_to_i16_batch(x_f32: np.ndarray):
 # C4. write_slc_hdf5
 # ---------------------------------------------------------------------------
 
+# Real problem found 2026-09-02, reported from an actual remote NISAR_CSAF
+# run (not synthetic): full-scene write_slc_hdf5() was extremely memory
+# hungry. Root cause -- it materialized the ENTIRE cropped region as a
+# stack of full-size temporaries at once: complex64 region (8 B/px), then
+# float64 real/imag copies (16 B/px), then float32 real/imag (8 B/px), then
+# f32_to_i16_batch's own internal finite/hi/lo/trunc/out temporaries
+# (several more float32/bool full-size arrays), then int16 outputs
+# (4 B/px), then a final interleaved int16 array (4 B/px) duplicating the
+# whole output right before the single fp.write(). For a full, uncropped
+# NISAR scene (region_cut left at pop_config's -999 "full scene" default,
+# now that that sentinel is actually honored -- see the two 2026-09-01
+# entries above) that peak, all at once, is many times the final 4 B/px
+# output size.
+# Fixed by chunking along rows: read/convert/quantize/write one horizontal
+# stripe of the HDF5 dataset at a time via ordinary h5py slicing (which
+# already only pulls the requested sub-region off disk, not the whole
+# dataset), instead of the full [yl:yh, xl:xh] region in one shot. Column
+# cropping (width2, the multiple-of-4 adjustment) is computed once up
+# front exactly as before and applies unchanged to every stripe; only the
+# row range is chunked, and the final adjusted (xl, xh, yl, yh) returned
+# is identical either way. The diagnostic counters (sat_hi/sat_lo/
+# zero_conv, sigma) are accumulated across chunks as exact integer sums
+# (int64, so summation order doesn't change the result) rather than
+# computed once over the full array -- output is otherwise unchanged.
+# No h5py in this environment to re-run the byte-for-byte parity test
+# against a real file, so verified instead with a standalone numpy-array
+# stand-in (h5py.Dataset slicing and plain ndarray slicing are the same
+# operation for this purpose): chunked vs. single-shot produced identical
+# .SLC bytes and identical diagnostic counters across several chunk sizes
+# and non-multiple-of-chunk-size row counts. Flagging per Rule 8 that this
+# is not the same as a real-HDF5-file regression test, which still needs
+# to be added once h5py/a real fixture are available.
+_DEFAULT_ROWS_PER_CHUNK = 4096
+
+
 def write_slc_hdf5(h5file: h5py.File, slc_path: str, mode: str, dfact: float,
-                    xl: int, xh: int, yl: int, yh: int, verbose: bool = True):
+                    xl: int, xh: int, yl: int, yh: int, verbose: bool = True,
+                    rows_per_chunk: int = _DEFAULT_ROWS_PER_CHUNK):
     """Mirrors write_slc_hdf5() in make_slc_nsr.c:134-256.
 
     Returns the ADJUSTED (xl, xh, yl, yh) — xh/yh are cropped down so that
     (xh-xl) and (yh-yl) are multiples of 4, matching the C exactly.
 
-    Deviates from the C only in HOW the HDF5 data is fetched: the C reads
-    the ENTIRE frequency/type dataset into RAM then crops; this reads only
-    the [yl:yh, xl:xh] sub-region via h5py fancy indexing. Both produce
-    bit-identical float32 values for the region actually written (HDF5
-    slicing is a solved, deterministic I/O primitive — this is a Phase D
-    perf optimization, not an algorithmic change, and is verified by the
-    byte-for-byte parity test against the real C binary).
+    Deviates from the C in two ways, neither of which changes the output
+    bytes (see AUDIT notes at both call sites / the block comment just
+    above this function): (1) reads only the [yl:yh, xl:xh] sub-region via
+    h5py slicing rather than the C's whole-dataset read, and (2) reads,
+    converts, and writes that sub-region in row-chunks of `rows_per_chunk`
+    rather than all at once, to bound peak memory regardless of scene size.
     """
     freq = mode[0]
     dtype_name = mode[1:]
@@ -307,32 +342,44 @@ def write_slc_hdf5(h5file: h5py.File, slc_path: str, mode: str, dfact: float,
     if verbose:
         print(f"Writing SLC..Image Size: {width2} X {height2}... ")
 
-    region = ds[yl:yh, xl:xh]  # complex64, shape (height2, width2)
-    real64 = region.real.astype(np.float64)
-    imag64 = region.imag.astype(np.float64)
-    real32 = (real64 * dfact).astype(np.float32)
-    imag32 = (imag64 * dfact).astype(np.float32)
+    sat_hi_count = 0
+    sat_lo_count = 0
+    zero_conv_count = 0
+    sum2 = 0  # exact int64 accumulator -- see block comment above
+    count = 0
 
-    real_i16, sh_r, sl_r, zc_r = f32_to_i16_batch(real32)
-    imag_i16, sh_i, sl_i, zc_i = f32_to_i16_batch(imag32)
+    with open(slc_path, "wb") as fp:
+        row = yl
+        while row < yh:
+            row_end = min(row + rows_per_chunk, yh)
+            region = ds[row:row_end, xl:xh]  # complex64, shape (chunk_h, width2)
+            real64 = region.real.astype(np.float64)
+            imag64 = region.imag.astype(np.float64)
+            real32 = (real64 * dfact).astype(np.float32)
+            imag32 = (imag64 * dfact).astype(np.float32)
 
-    sat_hi_count = sh_r + sh_i
-    sat_lo_count = sl_r + sl_i
-    zero_conv_count = zc_r + zc_i
+            real_i16, sh_r, sl_r, zc_r = f32_to_i16_batch(real32)
+            imag_i16, sh_i, sl_i, zc_i = f32_to_i16_batch(imag32)
+
+            sat_hi_count += sh_r + sh_i
+            sat_lo_count += sl_r + sl_i
+            zero_conv_count += zc_r + zc_i
+
+            chunk_h = row_end - row
+            interleaved = np.empty((chunk_h, width2, 2), dtype=np.int16)
+            interleaved[:, :, 0] = real_i16
+            interleaved[:, :, 1] = imag_i16
+
+            sum2 += int(np.sum(real_i16.astype(np.int64) ** 2))
+            count += chunk_h * width2
+
+            fp.write(interleaved.tobytes())
+            row = row_end
+
     # C's `ij` counts PIXELS (incremented once per (I,Q) pair in the j-loop),
     # not samples -- match that denominator for the diagnostic printfs below
     # (cosmetic only; not written to any output file).
     ij = height2 * width2
-
-    interleaved = np.empty((height2, width2, 2), dtype=np.int16)
-    interleaved[:, :, 0] = real_i16
-    interleaved[:, :, 1] = imag_i16
-
-    sum2 = float(np.sum(real_i16.astype(np.int64) ** 2))
-    count = height2 * width2
-
-    with open(slc_path, "wb") as fp:
-        fp.write(interleaved.tobytes())
 
     if verbose:
         print(f"fraction clamped to INT16_MAX: {sat_hi_count / ij:f}")
