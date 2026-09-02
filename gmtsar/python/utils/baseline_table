@@ -48,8 +48,28 @@ def _days_since(epoch_year, target_year, day_of_year, off_by_one):
     return delta + day_of_year + extra
 
 
-def _orb_id(input_file, ssc, ers_slc_tag, year, has_gmt_arg):
-    """Mimic the legacy SAT-specific substring extraction for ORB."""
+def _orb_id(input_file, ssc, ers_slc_tag, year, has_gmt_arg, aligned_prm=None):
+    """Mimic the legacy SAT-specific substring extraction for ORB.
+
+    Real bug found 2026-09-02, via an actual remote NISAR_CSAF run: for
+    NISAR (SC_identity 14, make_slc_nsr_py.SC_IDENTITY_NSR), this always
+    fell through to the default branch (`input_file.split('.')[0]`) and
+    returned "" -- make_slc_nsr_py.py's pop_prm_hdf5()/write_prm() never
+    set or wrote an `input_file` field into NISAR PRMs at all (unlike every
+    other sensor's preprocessor), so `_grep_value(aligned_prm, "input_file")`
+    at the call site always returns "". An empty ORB collapses the printed
+    row's leading field, which is why baseline_table.dat looked like it had
+    fewer columns than documented. Fixed with a dedicated NSR branch that
+    derives a stable, human-readable ID from the PRM's own filename stem
+    (e.g. "NSR_20260331A" from ".../NSR_20260331A.PRM") instead -- already
+    the canonical per-scene name used throughout this pipeline (stem_data.in,
+    align_batch_nsr, intf_batch), so no new PRM field is needed.
+    """
+    if ssc == 14:  # SC_IDENTITY_NSR (make_slc_nsr_py.py) -- NISAR
+        if aligned_prm:
+            import os
+            return os.path.splitext(os.path.basename(aligned_prm))[0]
+        return input_file  # fallback, shouldn't be reachable in practice
     if ssc == 5:
         if year < 2013:
             return input_file[13:18]            # substr 14,5 → [13:18]
@@ -104,6 +124,20 @@ def baseline_table():
         yday = _days_since(2008, year, day, off_by_one=False)
     elif ssc == 10:
         yday = _days_since(2014, year, day, off_by_one=False)
+    elif ssc == 14:  # SC_IDENTITY_NSR (make_slc_nsr_py.py) -- NISAR
+        # 2014 epoch, matching the module docstring's documented intent
+        # ("SC_identity 5, YR>=2013 (NISAR re-tagged) -> 2014-01-01") and
+        # pre_proc_batch_nsr._plot_baseline()'s hardcoded 2014 offset --
+        # that intent predates make_slc_nsr_py.py actually setting
+        # SC_identity=14 (not 5) in NISAR PRMs, which meant NSR silently
+        # fell into the `else` 2020 branch instead. Found 2026-09-02 while
+        # investigating why baseline_table.dat looked short a column;
+        # same root cause as the ORB fix above (SC_identity 14 not handled
+        # explicitly). Doesn't change relative baseline_table.dat math
+        # (all NSR rows share the same epoch either way, so select_pairs'
+        # day-separation comparisons were already self-consistent) but DID
+        # make stacktable_all.pdf's calendar-year x-axis wrong by ~6 years.
+        yday = _days_since(2014, year, day, off_by_one=False)
     else:
         yday = _days_since(2020, year, day, off_by_one=False)
 
@@ -128,10 +162,17 @@ def baseline_table():
 
     bpl = _grep_field3(sat_out, "B_parallel")
     bpr = _grep_field3(sat_out, "B_perpendicular")
-    xs  = _grep_field3(sat_out, "xshift")
-    ys  = _grep_field3(sat_out, "yshift")
+    # Real bug found 2026-09-02: SAT_baseline_py actually emits fields
+    # named "rshift"/"ashift" (range shift / azimuth shift -- see its
+    # write_prm_baseline()), never "xshift"/"yshift". These lookups always
+    # returned "" for every sensor, not just NISAR -- the two trailing
+    # columns of baseline_table.dat's default output have always been
+    # silently empty. Same investigation that found the NSR ORB bug below.
+    xs  = _grep_field3(sat_out, "rshift")
+    ys  = _grep_field3(sat_out, "ashift")
 
-    orb = _orb_id(aligned_input_file, ssc, ers_slc_tag, year, has_gmt_arg)
+    orb = _orb_id(aligned_input_file, ssc, ers_slc_tag, year, has_gmt_arg,
+                  aligned_prm=aligned_prm)
 
     if not has_gmt_arg:
         print(f"{orb} {st0} {yday} {bpl} {bpr} {xs} {ys}")

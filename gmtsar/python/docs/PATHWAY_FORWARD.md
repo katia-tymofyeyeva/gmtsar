@@ -132,6 +132,51 @@ pixels to exercise every branch of `f32_to_i16_batch`. **Still flagged per
 Rule 8**: this is not the same as a real-HDF5-file regression test against
 actual NISAR data, which still needs h5py + a real fixture to add properly.
 
+**Three bugs found 2026-09-02, in `baseline_table`, while investigating a
+user report of "only 4 columns" in `raw/baseline_table.dat`** (expected 7:
+`ORB ST0 YDAY Bpl Bperp xshift yshift`):
+
+1. **ORB always empty for NISAR.** `_orb_id()`'s default branch does
+   `input_file.split('.')[0]` on the aligned PRM's `input_file` field —
+   but `make_slc_nsr_py.py`'s `pop_prm_hdf5()`/`write_prm()` never sets or
+   writes an `input_file` field into NISAR PRMs at all (every other
+   sensor's preprocessor does). `SC_identity` 14
+   (`make_slc_nsr_py.SC_IDENTITY_NSR`) isn't one of `_orb_id`'s
+   special-cased values, so it always hit the default branch on `""`.
+   Fixed with a dedicated `ssc == 14` branch that derives a stable ID from
+   the aligned PRM's own filename stem (e.g. `NSR_20260331A`) instead —
+   already the canonical per-scene name used everywhere else in this
+   pipeline, no new PRM field needed.
+2. **xshift/yshift always empty, for every sensor, not just NISAR.**
+   `baseline_table` greps `SAT_baseline_py`'s stdout for literal keys
+   `"xshift"`/`"yshift"` — but `SAT_baseline_py`'s `write_prm_baseline()`
+   actually emits fields named `"rshift"`/`"ashift"` (range shift /
+   azimuth shift). Those two lookups have always returned `""`. Fixed by
+   matching the real key names.
+3. **Wrong epoch for NISAR's YDAY column (off by ~6 years' worth of
+   days).** The module docstring already documented an intended
+   `SC_identity 5, YR>=2013 (NISAR re-tagged) -> 2014-01-01` epoch — but
+   that predates `make_slc_nsr_py.py` actually setting `SC_identity=14`
+   (not 5) in NISAR PRMs, so NSR rows always fell into the generic `else`
+   branch (2020-01-01 epoch) instead. Didn't break `select_pairs`
+   relative-day-separation math (every NSR row shares the same wrong
+   epoch, so relative differences were still self-consistent), but did
+   make `pre_proc_batch_nsr`'s `stacktable_all.pdf` calendar-year x-axis
+   wrong, since that plot hardcodes a 2014 offset. Fixed with an explicit
+   `ssc == 14` branch using the 2014 epoch.
+
+All three root-caused by reading `SAT_baseline_py`'s actual output format
+and `make_slc_nsr_py.py`'s actual PRM field set side-by-side with
+`baseline_table`'s parsing/branching logic — not guessed. **Verified by
+reproduction**: a synthetic `SAT_baseline_py` stand-in + a NISAR-shaped PRM
+(no `input_file`, `SC_identity=14`) reproduced the exact reported symptom
+against the pre-fix code (`" 2026104.5432100000 2296 12.345... -45.678...  "`
+— leading space from the empty ORB, trailing double space from empty
+rshift/ashift, whitespace-splitting into exactly 4 tokens), and the fixed
+code produces all 7 fields correctly against the same synthetic input. Not
+a real-HDF5/real-SAT_baseline-binary test (flagged per Rule 8), but a
+stronger check than reasoning alone.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no
