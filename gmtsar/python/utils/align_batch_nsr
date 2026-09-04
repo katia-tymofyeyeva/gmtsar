@@ -24,7 +24,7 @@ Usage:  align_batch_nsr data.in
 import os
 import sys
 
-from gmtsar_lib import run
+from gmtsar_lib import run, grep_value, check_file_report
 
 
 def _stage_slc_inputs(name):
@@ -66,6 +66,62 @@ def _align_one(master, aligned):
     run(f"cp {aligned}.PRMresamp {aligned}.PRM")
 
 
+def _verify_aligned(master, aligned):
+    """Real bug found 2026-09-03, via an actual remote NISAR_CSAF run: this
+    check didn't exist. `run()` deliberately never raises on a nonzero exit
+    (see gmtsar_lib.run's docstring -- matches legacy csh's tolerance of
+    "benign" gmtsar warnings), so if ANY command in `_align_one` silently
+    failed for one scene (xcorr_py finding no usable correlation,
+    fitoffset_ra choking on a bad freq_xcorr.dat, resamp_py erroring, ...),
+    the following `mv`/`cp` would either no-op or overwrite nothing, and
+    that scene's `SLC/<aligned>.PRM` would silently stay whatever
+    `_stage_slc_inputs` originally staged there -- a *copy of the raw,
+    pre-alignment PRM*, with that scene's OWN native num_rng_bins (each
+    NISAR granule's raw dimensions are cropped independently in
+    write_slc_hdf5, so they can differ by a few pixels scene-to-scene even
+    at the same region_cut). align_batch_nsr would then report success for
+    every scene while having silently left one un-aligned. The failure only
+    surfaced much later, deep inside phasediff_py's dimension check
+    ("RuntimeError: The dimensions of range do not match") -- far from the
+    actual point of failure, with the real cause (whatever upstream command
+    actually failed) already scrolled off. Fixed by checking, right after
+    each scene's alignment, that its PRM/SLC/LED all exist AND that its
+    dimensions actually match the master's -- failing loudly with the exact
+    scene name and both dimension sets, instead of letting a silent
+    mismatch propagate.
+    """
+    for ext in ("PRM", "SLC", "LED"):
+        if not check_file_report(f"{aligned}.{ext}"):
+            sys.exit(
+                f"align_batch_nsr: FATAL: {aligned}.{ext} missing after "
+                f"alignment -- a command in the xcorr_py/fitoffset_ra/"
+                f"resamp_py chain for {aligned} likely failed silently "
+                f"(run() does not raise on nonzero exit; scroll back "
+                f"through this scene's log for a WARN). Not proceeding "
+                f"with a partially-aligned stack."
+            )
+    m_rng = int(grep_value(f"{master}.PRM", "num_rng_bins", 3))
+    m_az = (int(grep_value(f"{master}.PRM", "num_patches", 3))
+            * int(grep_value(f"{master}.PRM", "num_valid_az", 3)))
+    a_rng = int(grep_value(f"{aligned}.PRM", "num_rng_bins", 3))
+    a_az = (int(grep_value(f"{aligned}.PRM", "num_patches", 3))
+            * int(grep_value(f"{aligned}.PRM", "num_valid_az", 3)))
+    if (m_rng, m_az) != (a_rng, a_az):
+        sys.exit(
+            f"align_batch_nsr: FATAL: {aligned} did not conform to "
+            f"master {master}'s geometry after resamp_py -- "
+            f"master is {m_rng}x{m_az}, {aligned} is {a_rng}x{a_az}. "
+            f"resamp_py should always overwrite these fields from the "
+            f"master PRM; a mismatch means the resamp_py step for "
+            f"{aligned} likely failed silently and left the pre-alignment "
+            f"PRM in place (run() does not raise on nonzero exit -- scroll "
+            f"back through this scene's log for a WARN from xcorr_py, "
+            f"fitoffset_ra, or resamp_py). Not proceeding with a "
+            f"partially-aligned stack; re-run alignment for this scene "
+            f"specifically once the underlying failure is fixed."
+        )
+
+
 def align_batch_nsr():
     if len(sys.argv) != 2:
         sys.exit(
@@ -103,6 +159,7 @@ def align_batch_nsr():
     for i, aligned in enumerate(repeats, start=1):
         print(f"working on {aligned}  [ {i} / {n} ]")
         _align_one(master, aligned)
+        _verify_aligned(master, aligned)
 
     run("rm -f *.PRM0 *resamp amp*.grd freq_xcorr.dat r.grd a.grd")
     os.chdir("..")

@@ -177,6 +177,38 @@ code produces all 7 fields correctly against the same synthetic input. Not
 a real-HDF5/real-SAT_baseline-binary test (flagged per Rule 8), but a
 stronger check than reasoning alone.
 
+**Structural gap found 2026-09-03, via an actual remote NISAR_CSAF run
+reaching interferogram formation:** `phasediff_py` failed with `RuntimeError:
+The dimensions of range do not match` comparing the master's and a repeat
+scene's aligned PRMs from `SLC/` — many steps downstream of where the real
+problem occurred. Root cause: `align_batch_nsr`'s `_align_one()` chains
+`SAT_baseline_py` → `slc2amp` → `xcorr_py` → `fitoffset_ra` → `resamp_py` →
+`mv`/`cp` entirely through `gmtsar_lib.run()`, which by design never raises
+on a nonzero exit (see its docstring — matches legacy csh's tolerance of
+"benign" warnings). If any command in that chain silently failed for one
+scene, the trailing `mv {aligned}.SLCresamp {aligned}.SLC` / `cp
+{aligned}.PRMresamp {aligned}.PRM` would just no-op, leaving `SLC/<aligned>`
+as whatever `_stage_slc_inputs` originally staged there — a copy of the
+*pre-alignment* PRM, carrying that scene's own native dimensions (each
+NISAR granule's raw crop is computed independently in `write_slc_hdf5`, so
+scene-to-scene native widths can differ by a few pixels even at the same
+`region_cut`). `align_batch_nsr` reported success for every scene while one
+was silently left un-aligned; the mismatch only surfaced later, far from
+the actual point of failure, with the real upstream error already scrolled
+off the log. Fixed by adding `_verify_aligned()`, called right after each
+scene's `_align_one()`: checks `.PRM`/`.SLC`/`.LED` all exist, then checks
+the aligned PRM's `num_rng_bins`/`(num_patches*num_valid_az)` actually match
+the master's (which `resamp_py` is supposed to always overwrite from the
+master PRM) — failing loudly with the exact scene name and both dimension
+sets instead of letting a silent mismatch propagate. **Verified**: a
+synthetic test with matching-dims/mismatched-dims/missing-file PRM pairs
+confirmed the check passes silently when dimensions match and exits with a
+clear diagnostic in both failure cases. Doesn't fix whatever originally
+made the upstream command fail for that scene (unknown — the user's log
+didn't capture it) — that still needs investigating on a re-run, but now
+the failure will point at the right scene immediately instead of surfacing
+as a confusing dimension mismatch deep inside `phasediff_py`.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no
