@@ -30,8 +30,36 @@ SAT_OVERRIDES = {
     'ALOS4':      {'SLC_factor': 2.0},
     # NSR_A / NSR_B: NISAR repeat-pass interferograms (port of p2p_processing_nsr).
     # Treated similarly to ALOS_SLC for the standard P2P stages.
-    'NSR_A':      {'SLC_factor': 2.0},
-    'NSR_B':      {'SLC_factor': 2.0},
+    #
+    # Real bug found 2026-09-16, via an actual remote NISAR_CSAF run reaching
+    # geocode: corr.grd came out entirely 0.0 (not NaN) for every pixel.
+    # Traced through filter's correlation formula -- amp1.grd/amp2.grd (the
+    # two SLCs' own amplitude images) were ~1e-11 in magnitude, so their
+    # product fell below filter's hardcoded masking threshold (5e-21)
+    # almost everywhere, and GMTSAR's conv smoothing turns a near-total NaN
+    # mask into an all-zero output rather than propagating NaN. Root-caused
+    # further back: pre_proc_nsr's own diagnostic print ("sigma of integers
+    # (2048 < sig < 8192)") came out as 0, and "fraction set to 0 after
+    # cast" came out at 1.93 (out of a max of 2.0, since that counter sums
+    # real+imag channels) -- i.e. ~96% of every complex sample was
+    # quantizing to exactly 0 during the float32->int16 cast. This old
+    # SLC_factor=2.0 was carried over from ALOS-2's convention without ever
+    # being calibrated against real NISAR data -- NISAR's L1 RSLC product
+    # is radiometrically calibrated to real physical units, a completely
+    # different (much smaller) numeric scale than ALOS-2's raw digital
+    # counts. Measured directly from a real NISAR_CSAF granule: raw complex
+    # std ~0.325 (both real and imag, sampled from a 2000x2000 block of
+    # swaths/frequencyA/HH). GMTSAR's own quantization target is a
+    # post-scaling sigma of 2048-8192 (per pre_proc_nsr's diagnostic print);
+    # 0.325 * 12000 ~= 3900, comfortably inside that range (the same real
+    # data suggested ~12612 for a sigma of exactly 4096 -- 12000 is a round
+    # number with a bit of margin against clipping on brighter pixels).
+    # NOT verified across multiple granules/incidence angles -- if a
+    # different NISAR_CSAF stack still shows sigma near 0 or heavy
+    # clamping after this change, this default likely needs recalibrating
+    # against that data too, not assumed universal.
+    'NSR_A':      {'SLC_factor': 12000.0},
+    'NSR_B':      {'SLC_factor': 12000.0},
     'RS2':        {'filter_wavelength': 100},
     'TSX':        {'filter_wavelength': 100},
     'S1_TOPS':    {'spec_div': 0, 'spec_mode': 1, 'range_dec': 8, 'azimuth_dec': 2, 'det_stitch': 0},

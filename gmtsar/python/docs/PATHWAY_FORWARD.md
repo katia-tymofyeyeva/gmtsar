@@ -209,6 +209,110 @@ didn't capture it) — that still needs investigating on a re-run, but now
 the failure will point at the right scene immediately instead of surfacing
 as a confusing dimension mismatch deep inside `phasediff_py`.
 
+**Root cause + a real code bug found 2026-09-04, from a full `intf.txt` log
+of one interferogram's formation on the remote NISAR_CSAF machine:**
+`topo_ra.grd` was never created, and the failure cascaded silently through
+`grd2cpt`/`grdimage`/`psconvert` (all "Cannot find file topo_ra.grd"),
+`intf_batch` symlinking a dangling `topo_ra.grd`, and `filter`/`geocode`
+both crashing with `RuntimeError: read_gmt_grd requires netCDF4.` — while
+`dem2topo_ra` itself still exited 0 and `intf_batch` reported the whole
+run as `rc=0`.
+
+Root cause: **netCDF4 is not installed** in that remote conda environment.
+It's a declared dependency (`gmtsar/python/requirements.txt:21`,
+`netCDF4>=1.6`) used pervasively by this fork's in-process GMT
+replacements (`gmt_grd_io.read_gmt_grd`/`write_gmt_grd` — `dem2topo_ra`'s
+FLIPUD, `filter`'s amplitude/HYPOT step, `geocode`'s masking step). Install
+it (`pip install netCDF4` or `conda install -c conda-forge netcdf4` in the
+`gmtsar` env) and re-run `install.py --rebuild`.
+
+That alone doesn't explain why the failure was so hard to trace, though —
+a real bug in `dem2topo_ra`'s `_grdmath_flipud()` made it worse: when the
+in-process FLIPUD write raised (here, the missing-netCDF4 `RuntimeError`),
+its `except` handler was supposed to "flush the stashed in-memory grid to
+disk so the `gmt grdmath` subprocess fallback can still succeed" — but
+that flush re-popped `_PENDING_INMEM_GRID`, and the entry had already been
+popped earlier in the SAME `try` block, before the failing write. The
+second pop always returned `None`, so the entire recovery branch was
+unreachable dead code. The fallback subprocess then ran `gmt grdmath
+pixel.grd FLIPUD = topo_ra.grd` against a `pixel.grd` that was never
+written (the whole point of the in-memory chain is to skip writing it),
+failing with `grdmath [ERROR]: pixel.grd is not a number, operator or file
+name` — and since `run()` never raises on a nonzero exit, and
+`dem2topo_ra()` had no check that `topo_ra.grd` actually got produced,
+none of this stopped the pipeline from reporting success.
+
+Fixed two ways: (1) `_grdmath_flipud` now pops the stash exactly once, up
+front, into a variable reused by both the primary attempt and the
+recovery path, and the recovery's own failure is now fatal (`sys.exit`)
+instead of silently falling through to a doomed subprocess call; (2)
+`dem2topo_ra()` now checks `topo_ra.grd` actually exists right after the
+FLIPUD step and exits loudly if not, instead of printing "END" and
+returning normally. **Verified**: a standalone test against the real
+`_grdmath_flipud` function (mocking `_write_gmt_grd` to fail like the
+missing-netCDF4 case) confirmed the stash is now correctly available to
+the recovery path (previously always `None`) and that a recovery failure
+now exits before ever reaching the subprocess call; a separate success-path
+test confirmed the normal (dependency-present) case still writes directly
+with no subprocess and no behavior change.
+
+Separately, the same log showed `conv` failing near-instantly with `Can't
+open input data NSR_20260530A.SLC` for one repeat scene — likely the same
+class of silent alignment failure the `align_batch_nsr` fix above now
+catches, not something new; re-running step 2 after pulling that fix
+should confirm whether this scene aligned correctly.
+
+**Wrong default config value found 2026-09-16, via an actual remote
+NISAR_CSAF run reaching `geocode`:** `corr.grd` came out entirely `0.0`
+(not NaN) for every pixel, and `m2s_py` then raised `ValueError: 'llp' is
+empty or not a multiple of 3 float32s (got 0 values)` trying to build the
+lon/lat/data triplet file from it. Traced through `filter`'s correlation
+formula (`tmp.grd = amp1.grd*amp2.grd`; pixels with `tmp.grd < 5.e-21` are
+masked to NaN before the `conv` smoothing step that produces `corr.grd`):
+`amp1.grd`/`amp2.grd` (each SLC's own amplitude image) measured ~1e-11 in
+magnitude on this real data, so their product (~1e-22) fell below that
+hardcoded threshold almost everywhere — GMTSAR's `conv` turns a
+near-total NaN mask into an all-zero output rather than propagating NaN,
+which is what actually surfaced downstream as "0.0 everywhere" instead of
+"NaN everywhere."
+
+Root-caused one level further back via `pre_proc_nsr`'s own diagnostic
+prints on both the master and repeat scene, across both frequency bands:
+"sigma of integers (2048 < sig < 8192)" came out as `0`, and "fraction
+set to 0 after cast" came out at `1.93` out of a max of `2.0` (that
+counter sums real+imag channels) — i.e. ~96% of every complex sample was
+quantizing to exactly `0` during `make_slc_nsr_py.write_slc_hdf5()`'s
+float32→int16 cast. That cast is scaled by `SLC_factor` (a `pop_config`
+`SAT_OVERRIDES` field), which was `2.0` for both `NSR_A` and `NSR_B` — a
+value carried over from `ALOS2`'s convention, never calibrated against
+real NISAR data. NISAR's L1 RSLC product is radiometrically calibrated to
+real physical units, a completely different (much smaller) numeric scale
+than ALOS-2's raw digital counts, so `2.0` was never in the right
+ballpark. Measured directly from a real NISAR_CSAF granule (a 2000×2000
+block of `swaths/frequencyA/HH`, sampled by the user via a direct h5py
+one-liner): raw complex std ≈0.325 for both real and imag. GMTSAR's own
+quantization target is a post-scaling sigma of 2048-8192 (per
+`pre_proc_nsr`'s own diagnostic print); solving for the factor that lands
+at sigma 4096 gives ≈12,612. **Fixed**: `pop_config`'s `SAT_OVERRIDES`
+for `NSR_A`/`NSR_B` changed from `{'SLC_factor': 2.0}` to `{'SLC_factor':
+12000.0}` (rounded down from 12,612 for a bit of clipping margin on
+brighter pixels), with the full derivation recorded in a comment at the
+call site. **Verified**: `python3 -m py_compile utils/pop_config` clean,
+and `pop_config NSR_A` now emits `SLC_factor = 12000.0` in its generated
+config. **Not verified across multiple granules/incidence angles** — this
+is one real granule's measurement; if a different NISAR_CSAF stack still
+shows sigma near 0 (or heavy clipping) after this change, this default
+needs recalibrating against that data too, not assumed universal. **Two
+real-world consequences of this fix that are NOT automatic:** (1) any
+`config.NSR_A.txt`/`config.NSR_B.txt` already generated before this fix
+still has the old `SLC_factor = 2.0` baked in on disk — pulling this fix
+alone does not retroactively edit an existing file; it must be
+regenerated or hand-edited. (2) every `.SLC` file already produced by
+step 1 under the old factor is ~96% zeroed out (near-total data loss,
+not merely misaligned) — unlike the earlier alignment-only issue above,
+this is a defect in the data itself, so step 1 genuinely needs to be
+re-run for the whole stack, not just step 2/4.
+
 ## Landed 2026-07-23 (v2.10.x): native Windows — `install.py --system conda-windows-full`
 
 GMTSAR now builds and runs natively on Windows — no WSL, no

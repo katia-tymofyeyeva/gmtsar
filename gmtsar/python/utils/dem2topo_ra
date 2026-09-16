@@ -518,14 +518,37 @@ def _grdmath_flipud(src_grd: str, dst_grd: str) -> None:
     Skipped if either:
       - GMTSAR_GMT_INPROC=0 (debug fallback)
       - gmt_grd_io / netCDF4 not importable (fail-soft to subprocess)
+
+    Real bug found 2026-09-04, via an actual remote NISAR_CSAF run (netCDF4
+    not installed in that env): the in-process write raising inside the
+    `try` below used to trigger a "flush the stash to disk so the subprocess
+    fallback can succeed" recovery -- but that recovery re-popped
+    `_PENDING_INMEM_GRID`, and the entry had ALREADY been popped earlier in
+    the SAME `try` block, before the failing write. The second pop always
+    returned None, so the entire recovery branch was unreachable dead code.
+    The fallback `gmt grdmath` subprocess then ran against `pixel.grd`,
+    which was never written (the whole point of the in-memory chain is to
+    skip writing it) -- failing with "pixel.grd is not a number, operator
+    or file name". Because `run()` never raises on a nonzero exit and
+    dem2topo_ra() itself has no check that topo_ra.grd actually got
+    produced, this cascaded silently: grd2cpt/grdimage/psconvert all failed
+    to find topo_ra.grd, `dem2topo_ra` still exited 0, and `intf_batch`
+    happily proceeded to run `intf`/`filter`/`geocode` against a dangling
+    topo_ra.grd symlink for the rest of the case. Fixed by popping the
+    stash exactly ONCE, up front, into a variable reused by both the
+    primary attempt and the recovery path -- and by making the recovery's
+    OWN failure fatal (sys.exit) rather than swallowed, since at that point
+    neither the in-process nor the subprocess path can produce topo_ra.grd
+    and continuing would just repeat this same silent cascade.
     """
     use_inproc = _HAVE_GMT_GRD_IO and _inproc_enabled()
+    # Pop exactly once, regardless of which path below ends up using it.
+    stash = _PENDING_INMEM_GRID.pop(src_grd, None)
     if use_inproc:
         try:
             # Chain fast-path: upstream `_surface_inproc` may have stashed
             # an in-memory grid keyed by src_grd. Consume it directly and
             # skip the .grd read entirely (NFS round-trip elimination).
-            stash = _PENDING_INMEM_GRID.pop(src_grd, None)
             if stash is not None:
                 data = stash["grid"]
                 x = stash["x_coord"]
@@ -560,10 +583,10 @@ def _grdmath_flipud(src_grd: str, dst_grd: str) -> None:
             print(f"DEM2TOPO_RA: WARN: in-process FLIPUD failed ({exc!r}); "
                   "falling back to gmt subprocess.", file=sys.stderr)
             # If we'd stashed an in-mem grid but consumption failed, the
-            # disk file does not exist — flush the stash so we don't
-            # leave a dangling reference and force the subprocess to
-            # read a nonexistent file.
-            stash = _PENDING_INMEM_GRID.pop(src_grd, None)
+            # disk file does not exist — flush the stash (the SAME one
+            # popped above, not a re-pop -- see the docstring fix note)
+            # so we don't leave a dangling reference and force the
+            # subprocess to read a nonexistent file.
             if stash is not None:
                 # Emergency: write the stashed grid out so the subprocess
                 # path can succeed. This is a hard-failure recovery — we
@@ -577,15 +600,24 @@ def _grdmath_flipud(src_grd: str, dst_grd: str) -> None:
                         history=stash.get("history", ""),
                     )
                 except Exception as exc2:
-                    print(f"DEM2TOPO_RA: ERROR: stash-flush failed ({exc2!r})",
-                          file=sys.stderr)
-                    raise
+                    sys.exit(
+                        f"DEM2TOPO_RA: FATAL: stash-flush failed ({exc2!r}) "
+                        f"while recovering from in-process FLIPUD failure "
+                        f"({exc!r}) -- cannot write {src_grd} for the gmt "
+                        f"subprocess fallback either (likely the same "
+                        f"underlying dependency problem, e.g. netCDF4 not "
+                        f"installed -- see gmtsar/python/requirements.txt). "
+                        f"Refusing to continue: the pipeline would otherwise "
+                        f"silently proceed with no {dst_grd}, and every "
+                        f"downstream step (intf/filter/geocode) would "
+                        f"fail confusingly later instead."
+                    )
     # Fallback: classic gmt subprocess. If we still have a stash, flush
-    # it to disk first so the subprocess sees a real file. (This case
-    # happens when GMTSAR_GMT_INPROC=0 explicitly disables the in-proc
-    # path AFTER `_surface_inproc` ran with the chain on — unusual but
-    # possible.)
-    stash = _PENDING_INMEM_GRID.pop(src_grd, None)
+    # it to disk first so the subprocess sees a real file (the SAME stash
+    # popped above -- see the docstring fix note; this branch is reached
+    # when GMTSAR_GMT_INPROC=0 explicitly disables the in-proc path AFTER
+    # `_surface_inproc` ran with the chain on, or after a successful
+    # in-process attempt already returned above).
     if stash is not None:
         _write_gmt_grd(
             src_grd, stash["grid"], stash["x_coord"], stash["y_coord"],
@@ -1002,7 +1034,28 @@ def dem2topo_ra():
     # Set GMTSAR_GMT_INPROC=0 to fall back to `gmt grdmath`.
     with _dem2topo_phase("flipud"):
         _grdmath_flipud('pixel.grd', 'topo_ra.grd')
-    
+
+    # Real bug found 2026-09-04, via an actual remote NISAR_CSAF run: this
+    # check didn't exist. FLIPUD failing (e.g. the _grdmath_flipud recovery
+    # bug fixed above, or any other silent failure -- run() never raises on
+    # a nonzero exit) used to leave topo_ra.grd never created while
+    # dem2topo_ra() still printed "END" and returned normally. Every
+    # downstream consumer -- the grd2cpt/grdimage/psconvert plotting calls
+    # right below, and far more importantly intf_batch's entire
+    # intf/filter/geocode chain for every pair -- then failed confusingly
+    # against a missing or dangling-symlinked topo_ra.grd, with the real
+    # cause (FLIPUD) already scrolled off the log. Failing loudly HERE,
+    # immediately after the step that produces topo_ra.grd, points
+    # directly at the actual failure instead.
+    if not check_file_report('topo_ra.grd'):
+        sys.exit(
+            "DEM2TOPO_RA: FATAL: topo_ra.grd was not created -- the FLIPUD "
+            "step failed (see the WARN/FATAL above for the real cause, "
+            "e.g. netCDF4 not installed -- see gmtsar/python/"
+            "requirements.txt). Refusing to report success or let "
+            "intf_batch proceed against a missing topo_ra.grd."
+        )
+
     print(' ')
     print('DEM2TOPO_RA: plotting ... ...')
     run('gmt grd2cpt topo_ra.grd -Cgray '+str(V)+' -Z > topo_ra.cpt') 
