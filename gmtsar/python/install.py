@@ -245,6 +245,39 @@ def _find_existing_conda_env(envname: str) -> Path | None:
     return None
 
 
+def _conda_env_list_json(conda_exe: Path) -> dict[str, str]:
+    """{env_name: env_path} via `conda env list --json` -- the
+    AUTHORITATIVE source, not directory-guessing under a fixed base.
+
+    Real bug found 2026-09-18, via an actual remote run (a JupyterHub-
+    style host, not a fixture): `locate_conda_env()`'s pre- and post-
+    create checks both only ever looked under a fixed
+    `conda_base/envs/<name>` path. On this host, `envs_dirs` is
+    configured (via condarc) to a location OUTSIDE conda_base/envs -- a
+    common pattern where the base conda install (`/opt/conda`) is
+    read-only/root-owned, so per-user envs are redirected to live under
+    the user's own home directory instead (this project's own earlier
+    netCDF4 fix already pointed at exactly such a path,
+    `/home/jovyan/.local/envs/gmtsar`). `conda create -n gmtsar ...`
+    honored that config and genuinely created the env -- exit 0, ~67s of
+    real package installs -- but the fixed-path check couldn't find it,
+    so `locate_conda_env` reported "conda create exited 0 but
+    /opt/conda/envs/gmtsar still doesn't exist" even though the env
+    existed, just not where guessed. This is the exact same bug class
+    already found and fixed for Windows on 2026-07-23
+    (`_windows_conda_env_paths`, same docstring rationale) -- that fix
+    was never mirrored onto this POSIX path. `micromamba create -r
+    conda_base` isn't affected (it's given an explicit root prefix), but
+    plain `conda create -n` has no equivalent override here and always
+    defers to whatever `envs_dirs` resolves to."""
+    out = subprocess.run([str(conda_exe), "env", "list", "--json"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if out.returncode != 0:
+        sys.exit(f"ERROR: `conda env list --json` failed (rc={out.returncode}): {out.stderr}")
+    envs = json.loads(out.stdout).get("envs", [])
+    return {Path(p).name: p for p in envs}
+
+
 def locate_conda_base() -> Path:
     """Find the conda INSTALLATION (not a specific env) so a missing
     'gmtsar' env can be created. Checks $CONDA_EXE (set by conda's shell
@@ -438,6 +471,15 @@ def locate_conda_env(envname: str, packages: list[str] | None = None,
     candidate = conda_base / "envs" / envname
     if candidate.is_dir():
         return candidate
+    conda_exe = conda_base / "bin" / "conda"
+    # Authoritative check before assuming a fresh create is needed --
+    # envs_dirs may point somewhere other than conda_base/envs (e.g. a
+    # JupyterHub-style host with a root-owned base conda). See
+    # _conda_env_list_json's docstring.
+    if conda_exe.is_file():
+        found = _conda_env_list_json(conda_exe).get(envname)
+        if found and Path(found).is_dir():
+            return Path(found)
     creator = shutil.which("micromamba")
     creator_desc = f"{creator} create" if creator else f"{conda_base}/bin/conda create"
     print(f"==> conda env '{envname}' not found; creating it via "
@@ -448,14 +490,24 @@ def locate_conda_env(envname: str, packages: list[str] | None = None,
         run([creator, "create", "-y", "-r", str(conda_base), "-n", envname,
              "-c", "conda-forge"] + packages)
     else:
-        run([str(conda_base / "bin" / "conda"), "create", "-n", envname, "-y",
+        run([str(conda_exe), "create", "-n", envname, "-y",
              "-c", "conda-forge"] + packages)
-    if not candidate.is_dir():
-        sys.exit(
-            f"ERROR: conda create exited 0 but {candidate} still doesn't "
-            "exist -- check the conda output above."
-        )
-    return candidate
+    if candidate.is_dir():
+        return candidate
+    # Same authoritative fallback post-create: classic `conda create -n`
+    # (no explicit --prefix/-r) always defers to envs_dirs, which may not
+    # be conda_base/envs -- don't declare failure on a fixed-path guess
+    # alone (see _conda_env_list_json's docstring for the real incident
+    # this caught).
+    if conda_exe.is_file():
+        found = _conda_env_list_json(conda_exe).get(envname)
+        if found and Path(found).is_dir():
+            return Path(found)
+    sys.exit(
+        f"ERROR: conda create exited 0 but {candidate} still doesn't "
+        f"exist, and '{envname}' doesn't show up in `conda env list "
+        "--json` either -- check the conda output above."
+    )
 
 
 def _stage_one_windows(src: Path, dst: Path) -> None:

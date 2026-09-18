@@ -1,5 +1,51 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-18: `install.py`'s `locate_conda_env` guessed a fixed path instead of asking conda
+
+**Real bug found via an actual remote `install.py --system conda --conda-env
+gmtsar --rebuild` re-run** (a JupyterHub-style host, not a fixture): it
+failed with `ERROR: conda create exited 0 but /opt/conda/envs/gmtsar still
+doesn't exist -- check the conda output above` — even though the preceding
+`conda create -n gmtsar -y -c conda-forge gmt=6.4 ...` line logged `done in
+66.747s (rc=0)`, i.e. conda really did spend a minute genuinely installing
+packages, it just didn't put them where the script assumed.
+
+Root cause: `locate_conda_env()`'s pre-create existence check
+(`_find_existing_conda_env`) and its post-create success check both only
+ever looked at a fixed `conda_base/envs/<name>` path (`conda_base` resolved
+from `$CONDA_EXE`/`which conda`/a short list of common install roots). On
+this host, conda's `envs_dirs` config redirects new envs somewhere other
+than `conda_base/envs` — a common pattern where the base conda install
+(`/opt/conda`) is root-owned/read-only, so per-user envs live under the
+user's own home directory instead (this project's own earlier netCDF4 fix,
+2026-09-xx, already pointed at exactly such a path,
+`/home/jovyan/.local/envs/gmtsar`, for the same reason). `conda create -n
+gmtsar` has no `--prefix`/`-r` override here, so it silently honors
+`envs_dirs` and creates the env exactly where configured — just not at the
+one fixed path the script checked.
+
+This is the identical bug class already found and fixed for the Windows
+code path on 2026-07-23 (`_windows_conda_env_paths`, using `conda env list
+--json` as the authoritative source instead of directory-guessing) — that
+fix was never mirrored onto POSIX, so the same failure mode was still live
+here.
+
+**Fixed**: added `_conda_env_list_json()` (POSIX port of
+`_windows_conda_env_paths`' approach) and wired it into `locate_conda_env`
+as a fallback both before deciding a fresh `create` is needed and after
+`create` returns, before declaring failure — so a genuinely-existing env
+under a non-default `envs_dirs` location is found either way, and the
+error message only fires when the env truly doesn't exist anywhere `conda`
+itself reports. **Verified**: a standalone test (fake `conda` executable
+whose `env list --json` reports an env living outside `conda_base/envs`,
+and whose `create` exits 0 without ever populating `conda_base/envs/<name>`
+— reproducing the real host's exact behavior) confirms `locate_conda_env`
+now returns the real env path instead of erroring; a second test confirms
+a genuinely-nonexistent env (empty `env list --json`, still-missing
+directory after create) still fails loudly, with an updated message noting
+both checks were tried. **Not yet re-run against the real remote host** —
+next step is confirming this actually resolves the user's case there.
+
 ## Built 2026-08-09: NISAR batch/stack processing — `pre_proc_batch_nsr`, `align_batch_nsr`
 
 **Prototype, NOT yet validated against a real 3+ scene stack** (per Rule 13,
