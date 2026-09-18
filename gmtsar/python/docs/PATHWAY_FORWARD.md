@@ -43,9 +43,33 @@ and whose `create` exits 0 without ever populating `conda_base/envs/<name>`
 now returns the real env path instead of erroring; a second test confirms
 a genuinely-nonexistent env (empty `env list --json`, still-missing
 directory after create) still fails loudly, with an updated message noting
-both checks were tried. **Not yet re-run against the real remote host** —
-next step is confirming this actually resolves the user's case there.
+both checks were tried.
 
+**Severity correction, same day, once re-run against the real remote host:**
+this was NOT merely a wrong error message — the failed `conda create -n
+gmtsar -y ...` call that produced the original error had already silently
+**wiped and recreated** the user's real `gmtsar` env in place, destroying
+everything installed into it beyond this fork's bare bootstrap package list
+(h5py, numba, and netCDF4, all installed by hand over the course of this
+session, were gone; `import h5py` started failing in scripts that had
+worked minutes earlier). Root mechanism, confirmed against conda's own
+documented behavior (see
+https://github.com/conda/conda/issues/10432): `conda create -n <name>`,
+when `<name>` already exists ANYWHERE in conda's own environment registry
+(not just under the fixed path this script was checking), prints `WARNING:
+A conda environment already exists at '<path>' / Remove existing
+environment (y/[n])?` — and `-y` (which `install.py`'s create call always
+passes) auto-confirms that prompt too, not just package-plan confirmations.
+So the pre-fix code's blind-guess existence check didn't just fail to
+*find* the real env — by failing to find it, it walked straight into
+conda's own destroy-and-recreate path for a same-named env it didn't know
+it was colliding with. The fix above (checking `conda env list --json`
+*before* ever calling `create`) closes this for good going forward — the
+real env is now found and returned before the destructive `create -y` call
+is ever reached — but it cannot undo damage from a run that predates the
+fix. **Recovery for anyone hitting this**: re-run `install.py --system
+conda --conda-env <env>` *without* `--rebuild` (so `do_python_deps()` runs
+again) to reinstall `requirements.txt` into the recreated env.
 ## Built 2026-08-09: NISAR batch/stack processing — `pre_proc_batch_nsr`, `align_batch_nsr`
 
 **Prototype, NOT yet validated against a real 3+ scene stack** (per Rule 13,
