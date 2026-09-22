@@ -1,5 +1,89 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-09-21: `correct_iono` (split-spectrum ionospheric correction) wired into `intf_batch`
+
+**New feature, at the user's explicit request — NOT a port of existing
+tested code, and NOT yet verified against real data.** Before this,
+`intf_batch` (the batch/stack driver behind `batch_processing` step 4)
+never read `correct_iono` from config at all — setting it had zero effect.
+Ionospheric correction only existed in the single-pair `p2p_processing`
+path (`p2p_stages.py`'s `P2P4MakeFilterInterferograms`), which the user
+isn't using for their NISAR_CSAF stack.
+
+**What it does**: split-spectrum ionospheric phase estimation (Gomba et al.
+2016, Fattahi et al. 2017 filtering) — the same algorithm `p2p_stages.py`
+already implements, not a different method. `intf_batch` gained two new
+functions: `_iono_split_scene` (splits one already-aligned scene's SLC
+into high/low sub-bands via `split_spectrum`, once per unique scene
+appearing in `intf.in` — idempotent, skips a scene already split) and
+`_iono_one_pair` (per pair: intf+filter each of high/low/original,
+optionally unwrap and call `estimate_ionospheric_phase` to produce a
+corrected `phasefilt.grd`). Gated end-to-end by `correct_iono` (default 0
+— every line of this feature is dead code unless a config explicitly sets
+`correct_iono = 1`); further gated by `iono_skip_est` (default 1, matching
+the existing project-wide default in `pop_config`'s template — i.e. even
+with `correct_iono=1`, the unwrap+correction step is skipped by default,
+only the raw high/low/orig `phasefilt.grd` screens are produced until the
+user also sets `iono_skip_est = 0`). `correct_iono=1` additionally requires
+`range_dec`/`azimuth_dec` in config (used to decimate the iono-specific
+filter step) — fails loud with a clear message if either is missing,
+rather than guessing a default (neither has a universally sensible one).
+
+**A real design simplification, not a straight port**: `p2p_stages.py`'s
+iono path runs `split_spectrum` mid-alignment, before the final `resamp_py`
+swap — so it has to re-derive a resample step for the high/low sub-bands
+afterward, via `_iono_LH_fitoffset_and_resamp`. While investigating that
+function to decide whether to reuse it, found a real, separate, pre-existing
+latent bug in it (not touched by this change, not exercised by anything):
+it symlinks a frequency file under one name (`freq_alos2.dat` for most
+SATs, including a nonexistent one for NSR) but then unconditionally reads
+a different hardcoded filename (`freq_xcorr.dat`) — broken for any SAT
+outside the small `_SAT_RAW_INPUT` group. Rather than depend on (or fix)
+that function, `intf_batch`'s version sidesteps the whole problem: because
+`intf_batch` only ever runs after `align_batch`/`align_batch_nsr` has
+*already* produced a fully-aligned, master-conforming `SLC/<stem>.SLC`,
+`split_spectrum`'s high/low outputs inherit that same alignment directly
+(splitting the range spectrum doesn't move any pixels) — no resample step
+needed at all. This was confirmed as sound reasoning with the user (who
+has NISAR ionospheric-correction domain expertise) before implementing,
+not assumed unilaterally.
+
+**Explicitly out of scope for this round, flagged by the user**: NISAR
+actually acquires two REAL, physically-separate frequency bands (A and
+B) — using the real Frequency-B interferogram as the "other band" for
+ionospheric estimation, instead of a synthetic `split_spectrum` of one
+band, would be a more scientifically appropriate method for NISAR
+specifically. Checked the actual upstream reference this fork is ported
+from (`gmtsar/csh/p2p_processing_nsr.csh`, itself a very recent,
+provisional addition marked "needs to be integrated back into the generic
+p2p_processing.csh") — it does NOT implement real dual-frequency
+correction either; it uses the same generic synthetic split-spectrum
+method for NSR as every other single-band sensor. So there is no existing
+implementation anywhere in this codebase (Python or csh) to fall back on
+or port. The user is going to look for a GMTSAR variant that does this
+properly and follow up — worth revisiting once found, per their explicit
+request to keep this in mind as a future option.
+
+**Verified**: `python3 -m py_compile utils/intf_batch` clean. Standalone
+mock test (no real GMT/GMTSAR/data available in the environment that made
+this change — same limitation as every other fix this session) covering:
+(1) `correct_iono` unset produces literally zero new calls versus the
+pre-existing behavior — the regression-safety guarantee the user explicitly
+asked for when scoping this work; (2) `correct_iono=1` with the default
+`iono_skip_est=1` splits each of 3 unique scenes across 2 pairs exactly
+once (not once per pair), builds high/low/orig interferograms per pair,
+and does not call `estimate_ionospheric_phase`; (3) `correct_iono=1,
+iono_skip_est=0` does call `estimate_ionospheric_phase` once per pair and
+composes a corrected `phasefilt.grd`; (4) `correct_iono=1` without
+`range_dec`/`azimuth_dec` fails loud with a clear message rather than
+guessing; (5) a scene already split (an existing `SLC_H`/`SLC_L` `.SLC`)
+is correctly skipped on a re-run. **None of this has been run against
+real NISAR data or real GMT** — the user is running it against their
+actual NISAR_CSAF stack next and will inspect the resulting phase screens
+directly; if the reasoning above about not needing a resample step turns
+out to be wrong, or the results look off, this is the first place to
+revisit.
+
 ## Fixed 2026-09-18: `install.py`'s `locate_conda_env` guessed a fixed path instead of asking conda
 
 **Real bug found via an actual remote `install.py --system conda --conda-env

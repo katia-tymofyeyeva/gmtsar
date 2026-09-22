@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 
-from gmtsar_lib import run, grep_value, check_file_report
+from gmtsar_lib import run, grep_value, check_file_report, file_shuttle, replace_strings
 
 
 _SUPPORTED_SATS = {"ALOS", "ENVI", "ERS", "ENVI_SLC", "TSX", "NSR_A", "NSR_B"}
@@ -88,9 +88,125 @@ def _topo_stage(master, SAT, topo_phase, shift_topo):
     print("OFFSET_TOPO - END")
 
 
+def _iono_split_scene(case_root, stem):
+    """Split-spectrum ionospheric correction, added 2026-09-21 at the user's
+    request (correct_iono support did not exist anywhere in intf_batch
+    before this). One-time, per-SCENE step (not per-pair, unlike the
+    single-pair p2p_processing/p2p_stages.py path, which only ever sees 2
+    scenes at once and re-splits per pair) -- SLC_H/<stem>.SLC and
+    SLC_L/<stem>.SLC, once produced, are shared by every pair referencing
+    this scene. Idempotent: skips a scene already split.
+
+    Deliberately simpler than p2p_stages.py's P2P2FocusAlign iono branch:
+    that path runs split_spectrum mid-alignment, BEFORE the final resamp_py
+    swap, so it has to re-derive a resample step for the high/low sub-bands
+    afterward (and its generic fallback for that resample step has its own
+    latent bug -- see p2p_stages.py's _iono_LH_fitoffset_and_resamp, not
+    touched by this change). intf_batch only ever runs after align_batch/
+    align_batch_nsr has ALREADY produced a fully-aligned, master-conforming
+    SLC/<stem>.SLC -- split_spectrum is a pure range-spectral bandpass
+    filter on that already-aligned complex SLC, so its SLCH/SLCL outputs
+    inherit the exact same per-pixel geometry with no further resampling
+    needed. This is a real design simplification made possible by
+    intf_batch's stage separation, not a port of any existing tested code --
+    flagged as such in PATHWAY_FORWARD.md."""
+    slc_h = os.path.join(case_root, "SLC_H", f"{stem}.SLC")
+    slc_l = os.path.join(case_root, "SLC_L", f"{stem}.SLC")
+    if check_file_report(slc_h) and check_file_report(slc_l):
+        print(f"IONO: {stem} already split into SLC_H/SLC_L -- skipping")
+        return
+    print(f"IONO: splitting {stem} into high/low sub-bands")
+    os.chdir(os.path.join(case_root, "SLC"))
+    params_file = f"params_{stem}"
+    run(f"split_spectrum {stem}.PRM > {params_file}")
+    file_shuttle("SLCH", slc_h, "mv")
+    file_shuttle("SLCL", slc_l, "mv")
+    params_path = os.path.join(case_root, "SLC", params_file)
+    master_prm = os.path.join(case_root, "SLC", f"{stem}.PRM")
+    led_path = os.path.join(case_root, "raw", f"{stem}.LED")
+    for side, key in (("SLC_H", "high_wavelength"), ("SLC_L", "low_wavelength")):
+        os.chdir(os.path.join(case_root, side))
+        wl = grep_value(params_path, key, 3)
+        run(f"cp {master_prm} .")
+        run(f"ln -sf {led_path} .")
+        replace_strings(f"{stem}.PRM", "wavelength", f"radar_wavelength = {wl}")
+    os.chdir(case_root)
+
+
+def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
+                   iono_skip_est, mask_water, switch_land, topo_phase,
+                   shift_topo, iono_filt_rng, iono_filt_azi, region_cut):
+    """Split-spectrum ionospheric phase estimate for one pair (Gomba et al.
+    2016 method, Fattahi et al. 2017 filtering -- same algorithm
+    p2p_stages.py's P2P4MakeFilterInterferograms uses, reimplemented here
+    against intf_batch's shared per-scene SLC_H/SLC_L rather than per-pair
+    copies; see _iono_split_scene's docstring for why no resample step is
+    needed here). Produces intf/<sub>/iono_phase/intf_{h,l,o}/phasefilt.grd
+    always; if iono_skip_est == 0, additionally unwraps each and calls
+    estimate_ionospheric_phase to produce a corrected
+    intf/<sub>/phasefilt.grd (moving the uncorrected version aside as
+    phasefilt_non_corrected.grd). NOT verified against real data -- new
+    code, only checked with a standalone mock test (see
+    bin_py/tests/test_intf_batch_iono.py)."""
+    print(f"\nIONO PHASE ESTIMATE - START (pair {sub})")
+    intf_sub = os.path.join(case_root, "intf", sub)
+    iono_dir = os.path.join(intf_sub, "iono_phase")
+    if os.path.isdir(iono_dir):
+        run(f"rm -rf {iono_dir}")
+    os.makedirs(iono_dir)
+    for d in ("intf_h", "intf_l", "intf_o", "iono_correction"):
+        os.makedirs(os.path.join(iono_dir, d), exist_ok=True)
+
+    topo_dir = os.path.join(case_root, "topo")
+    slc_dirs = {
+        "intf_h": os.path.join(case_root, "SLC_H"),
+        "intf_l": os.path.join(case_root, "SLC_L"),
+        "intf_o": os.path.join(case_root, "SLC"),
+    }
+    for side in ("intf_h", "intf_l", "intf_o"):
+        os.chdir(os.path.join(iono_dir, side))
+        slc_dir = slc_dirs[side]
+        run(f"ln -sf {slc_dir}/{ref}.LED .")
+        run(f"ln -sf {slc_dir}/{rep}.LED .")
+        run(f"ln -sf {slc_dir}/{ref}.SLC .")
+        run(f"ln -sf {slc_dir}/{rep}.SLC .")
+        run(f"cp {slc_dir}/{ref}.PRM .")
+        run(f"cp {slc_dir}/{rep}.PRM .")
+        if topo_phase == 1:
+            topo_file = "topo_shift.grd" if shift_topo == 1 else "topo_ra.grd"
+            run(f"ln -sf {topo_dir}/{topo_file} .")
+            run(f"intf {ref}.PRM {rep}.PRM -topo {topo_file}")
+        else:
+            run(f"intf {ref}.PRM {rep}.PRM")
+        run(f"filter {ref}.PRM {rep}.PRM 500 {dec} {new_incx} {new_incy}")
+        file_shuttle("phase.grd", "phasefilt.grd", "cp")
+        if iono_skip_est == 0:
+            if mask_water == 1 or switch_land == 1:
+                if not check_file_report(os.path.join(topo_dir, "landmask_ra.grd")):
+                    os.chdir(topo_dir)
+                    run(f"landmask {region_cut}")
+                    os.chdir(os.path.join(iono_dir, side))
+                run(f"ln -sf {topo_dir}/landmask_ra.grd .")
+            run("snaphu_interp 0.05 0")
+
+    if iono_skip_est == 0:
+        os.chdir(os.path.join(iono_dir, "iono_correction"))
+        run(f"estimate_ionospheric_phase ../intf_h ../intf_l ../intf_o "
+            f"{intf_sub} {iono_filt_rng} {iono_filt_azi}")
+        os.chdir(intf_sub)
+        file_shuttle("phasefilt.grd", "phasefilt_non_corrected.grd", "mv")
+        run(f"gmt grdsample {iono_dir}/iono_correction/ph_iono_orig.grd "
+            "-Rphasefilt_non_corrected.grd -Gph_iono.grd")
+        run("gmt grdmath phasefilt_non_corrected.grd ph_iono.grd SUB PI ADD "
+            "2 PI MUL MOD PI SUB = phasefilt.grd")
+    os.chdir(intf_sub)
+    print(f"IONO PHASE ESTIMATE - END (pair {sub})")
+
+
 def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
                    threshold_snaphu, defomax, region_cut, near_interp,
-                   mask_water, switch_land, threshold_geocode):
+                   mask_water, switch_land, threshold_geocode,
+                   correct_iono=0, iono_args=None, case_root=None):
     """Per-pair work: intf + filter + snaphu + geocode in intf/<ref_id>_<rep_id>/."""
     ref_id = int(float(grep_value(f"./SLC/{ref}.PRM", "SC_clock_start", 3)))
     rep_id = int(float(grep_value(f"./SLC/{rep}.PRM", "SC_clock_start", 3)))
@@ -121,6 +237,15 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
             "gmt grdinfo phase.grd -I- | cut -c3-20",
             shell=True, stdout=subprocess.PIPE,
         ).stdout.decode("utf-8", "replace").strip()
+
+    if correct_iono == 1:
+        _iono_one_pair(
+            case_root, ref, rep, sub, dec,
+            iono_args["new_incx"], iono_args["new_incy"],
+            iono_args["iono_skip_est"], mask_water, switch_land,
+            topo_phase, shift_topo, iono_args["iono_filt_rng"],
+            iono_args["iono_filt_azi"], region_cut,
+        )
 
     if threshold_snaphu != 0:
         if mask_water == 1 or switch_land == 1:
@@ -180,6 +305,36 @@ def intf_batch():
     near_interp       = int(_get_config(config, "near_interp", "0") or 0)
     mask_water        = int(_get_config(config, "mask_water", "0") or 0)
 
+    # correct_iono support added 2026-09-21 (see _iono_split_scene's
+    # docstring) -- defaults to 0/off, at which point every line below is
+    # dead code and the pair loop is byte-for-byte what it was before this
+    # feature existed. Only exercised at all when a config explicitly opts in.
+    correct_iono      = int(_get_config(config, "correct_iono", "0") or 0)
+    iono_args = None
+    case_root = os.getcwd()
+    if correct_iono == 1:
+        iono_filt_rng = _get_config(config, "iono_filt_rng", "200") or "200"
+        iono_filt_azi = _get_config(config, "iono_filt_azi", "200") or "200"
+        iono_dsamp    = int(_get_config(config, "iono_dsamp", "1") or 1)
+        iono_skip_est = int(_get_config(config, "iono_skip_est", "1") or 1)
+        range_dec_raw   = _get_config(config, "range_dec", "")
+        azimuth_dec_raw = _get_config(config, "azimuth_dec", "")
+        if not range_dec_raw or not azimuth_dec_raw:
+            sys.exit(
+                "[ERROR]: correct_iono=1 requires range_dec and azimuth_dec "
+                "to be set in config (used to decimate the iono-specific "
+                "filter step) -- neither has a sensible default for every "
+                "SAT, so this fails loud rather than guessing. Add both "
+                "to your config file and re-run."
+            )
+        new_incx = int(range_dec_raw) * iono_dsamp
+        new_incy = int(azimuth_dec_raw) * iono_dsamp
+        iono_args = {
+            "new_incx": new_incx, "new_incy": new_incy,
+            "iono_skip_est": iono_skip_est,
+            "iono_filt_rng": iono_filt_rng, "iono_filt_azi": iono_filt_azi,
+        }
+
     if stage <= 1:
         _topo_stage(master, SAT, topo_phase, shift_topo)
 
@@ -188,12 +343,25 @@ def intf_batch():
         os.makedirs("intf", exist_ok=True)
         with open(intf_in) as f:
             pairs = [ln.strip() for ln in f if ":" in ln]
+
+        if correct_iono == 1:
+            os.makedirs("SLC_H", exist_ok=True)
+            os.makedirs("SLC_L", exist_ok=True)
+            scenes = []
+            for line in pairs:
+                for name in line.split(":", 1):
+                    if name not in scenes:
+                        scenes.append(name)
+            for stem in scenes:
+                _iono_split_scene(case_root, stem)
+
         for line in pairs:
             ref, rep = line.split(":", 1)
             _intf_one_pair(
                 ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
                 threshold_snaphu, defomax, region_cut, near_interp,
                 mask_water, switch_land, threshold_geocode,
+                correct_iono, iono_args, case_root,
             )
         print("\nEND FORM A STACK OF INTERFEROGRAMS")
 
