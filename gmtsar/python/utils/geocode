@@ -315,6 +315,15 @@ def geocode():
         _project('unwrap.grd', 'unwrap_ll.grd')
         run(f'gmt grdedit -D//"radians"/1///"{pwd_basename} unwrapped phase"/"{remarked}"  unwrap_ll.grd')
 
+    # ph_iono.grd only exists for a pair processed with correct_iono=1
+    # (intf_batch's split-spectrum ionospheric correction, added
+    # 2026-09-21 -- see PATHWAY_FORWARD.md) -- guarded the same way as
+    # every other optional grid above, so a workflow run without
+    # ionospheric correction sees no change here at all.
+    if check_file_report('ph_iono.grd')==True:
+        _project('ph_iono.grd', 'ph_iono_ll.grd')
+        run(f'gmt grdedit -D//"radians"/1///"{pwd_basename} ionospheric phase screen"/"{remarked}"  ph_iono_ll.grd')
+
     if check_file_report('phasefilt_mask.grd')==True:
         _project('phasefilt_mask.grd', 'phasefilt_mask_ll.grd')
         run(f'gmt grdedit -D//"phase in radians"/1///"{pwd_basename} wrapped phase masked filtered"/"{remarked}"   phasefilt_mask_ll.grd')

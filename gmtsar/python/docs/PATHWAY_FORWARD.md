@@ -1,5 +1,78 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-23: `correct_iono` silently wrote a blank `radar_wavelength`, surfacing as a `ZeroDivisionError` ~15 minutes later inside `filter`
+
+Real failure from the user's first full `correct_iono=1` run on real
+NISAR_CSAF data (pair NSR_20260331A/NSR_20260412A): `intf` for the
+`intf_h`/`intf_l` sub-bands "succeeded" (rc=0 — the wrapper script always
+exits 0 regardless of what happened inside it, same tolerance pattern as
+everywhere else in this codebase), but never actually wrote
+`real.grd`/`imag.grd`/`phase.grd`. ~15 minutes later, `filter` crashed with
+`FileNotFoundError: ... 'realfilt.grd'` — nowhere near the real cause.
+
+Root cause: `_iono_split_scene` (added 2026-09-21, see below) does
+
+```python
+wl = grep_value(params_path, key, 3)
+...
+replace_strings(f"{stem}.PRM", "wavelength", f"radar_wavelength = {wl}")
+```
+
+`grep_value` returns `""` (never raises) if `split_spectrum`'s redirected
+stdout (`params_{stem}`) doesn't contain a `high_wavelength`/
+`low_wavelength` line — which is exactly what happened for this scene
+pair. `replace_strings` then wrote `radar_wavelength = ` (empty value) into
+the split-band PRM. `phasediff_py`'s `_parse_prm` sees the empty value,
+skips the key (`if not val: continue`), and `p["lambda"]` stays at its
+`0.0` default — so `cnst = -4.0 * PI / p2["lambda"]` inside `phasediff`
+divides by zero, `phasediff_py` exits 1, `run()` swallows it with a WARN,
+and `intf`'s wrapper script "finishes" anyway with nothing written. The
+actual upstream question — why `split_spectrum` didn't produce a usable
+`high_wavelength`/`low_wavelength` line for this scene — is still open;
+this fix stops the failure from masquerading as a `filter`/`conv` bug 15
+minutes downstream, but doesn't explain `split_spectrum`'s own behavior
+here. Next time this fires, the new error message points straight at the
+scene and the exact command to re-run manually to see why.
+
+Fixed by validating `wl` in `_iono_split_scene` before writing it into the
+PRM: if it isn't a nonzero number, raise immediately with the scene name,
+the `params_path`, and the exact `split_spectrum` command to re-run by
+hand — instead of writing a broken PRM that fails silently, far away, much
+later. Consistent with this project's no-silent-fallback rule.
+
+**Verification**: added `test_split_scene_empty_wavelength_fails_loud` to
+`bin_py/tests/test_intf_batch_iono.py` (mocks `grep_value` to return `""`,
+asserts `_iono_split_scene` raises `RuntimeError` naming `high_wavelength`
+and `split_spectrum`). All 6 tests in that file pass
+(`python3 -m unittest test_intf_batch_iono`).
+
+## Built 2026-09-23: `geocode` now projects `ph_iono.grd` to `ph_iono_ll.grd`
+
+Real gap found by the user while inspecting the first correct_iono run
+(see the 2026-09-21 entry below): `geocode` projects a fixed list of
+radar-geometry grids to lon/lat (`corr.grd`, `phasefilt.grd`, `unwrap.grd`,
+...) but never touched `ph_iono.grd` (the ionospheric phase screen
+`intf_batch`'s iono block produces) — so the screen only ever existed in
+radar coordinates, with no geocoded counterpart to actually look at
+geographically. Fixed by adding one more guarded block, following the
+exact pattern already used for every other optional grid in this function
+(`if check_file_report('X.grd'): _project(...)`) — `ph_iono.grd` only
+exists for a pair processed with `correct_iono=1`, so a workflow run
+without ionospheric correction hits `check_file_report`'s `False` branch
+and this is a no-op, identical to before. Produces `ph_iono_ll.grd`.
+
+**Verification note**: `python3 -m py_compile utils/geocode` passes. Did
+NOT add a dedicated mocked test for this one line — `geocode()` is one
+large monolithic function that reads many other grids unconditionally
+before reaching this point, so exercising it end-to-end would require
+mocking most of the function's internals for a change that is a direct,
+structural copy of four already-adjacent guarded blocks (`unwrap.grd`,
+`unwrap_mask.grd`, `xphase_mask.grd`, `phasefilt_mask.grd`) doing exactly
+the same `check_file_report` + `_project` + `grdedit` sequence. Flagging
+this honestly rather than claiming coverage that doesn't exist — if this
+turns out wrong, the four neighboring blocks are the reference to compare
+against.
+
 ## Built 2026-09-21: `correct_iono` (split-spectrum ionospheric correction) wired into `intf_batch`
 
 **New feature, at the user's explicit request — NOT a port of existing

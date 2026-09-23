@@ -210,6 +210,37 @@ mask_water = 0
         finally:
             shutil.rmtree(tmpdir)
 
+    def test_split_scene_empty_wavelength_fails_loud(self):
+        """Real bug found 2026-09-23 on NSR_20260331A/NSR_20260412A: a
+        split_spectrum call that doesn't produce a usable high_wavelength/
+        low_wavelength line used to silently write 'radar_wavelength = '
+        (empty) into the PRM, leaving phasediff_py's lambda at its 0.0
+        default -- surfacing ~15 minutes later as a ZeroDivisionError deep
+        inside filter's real.grd/imag.grd step, nowhere near the real
+        cause. _iono_split_scene must now raise immediately instead."""
+        tmpdir = tempfile.mkdtemp()
+        cwd0 = os.getcwd()
+        try:
+            self._build_case(tmpdir)
+            os.chdir(os.path.join(tmpdir, "SLC"))
+            open("MASTER.PRM", "w").close()
+            # Empty params file: grep_value finds no high_wavelength line.
+            open("params_MASTER", "w").close()
+
+            def fake_grep_value_empty(fn, s, i):
+                self.calls.append(("grep_value", fn, s, i))
+                return ""  # mirrors intFloatOrString's failure return
+
+            gmtsar_lib.grep_value = fake_grep_value_empty
+            intf_batch.grep_value = fake_grep_value_empty
+            with self.assertRaises(RuntimeError) as ctx:
+                intf_batch._iono_split_scene(tmpdir, "MASTER")
+            self.assertIn("high_wavelength", str(ctx.exception))
+            self.assertIn("split_spectrum", str(ctx.exception))
+        finally:
+            os.chdir(cwd0)
+            shutil.rmtree(tmpdir)
+
     def test_already_split_scene_is_skipped(self):
         calls = self._run_case(
             "correct_iono = 1\nrange_dec = 8\nazimuth_dec = 8\n",

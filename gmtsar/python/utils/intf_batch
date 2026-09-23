@@ -127,6 +127,25 @@ def _iono_split_scene(case_root, stem):
     for side, key in (("SLC_H", "high_wavelength"), ("SLC_L", "low_wavelength")):
         os.chdir(os.path.join(case_root, side))
         wl = grep_value(params_path, key, 3)
+        # grep_value/replace_strings never raise (matches the rest of this
+        # codebase's run() tolerance), so a failed split_spectrum call or a
+        # missing "{key}" line in params_path used to write silently as
+        # "radar_wavelength = " (empty) -- phasediff_py's PRM parser then
+        # skips the empty value, leaving lambda at its 0.0 default, which
+        # only surfaces ~15 minutes later as a ZeroDivisionError deep
+        # inside filter's real.grd/imag.grd step (found 2026-09-23 on real
+        # NSR_20260331A/NSR_20260412A data). Fail loud here instead, right
+        # where the actual cause is, per this project's no-silent-fallback
+        # rule -- see PATHWAY_FORWARD.md.
+        if not isinstance(wl, (int, float)) or wl == 0:
+            raise RuntimeError(
+                f"_iono_split_scene: could not read a usable '{key}' value "
+                f"from {params_path} (got {wl!r}). This means "
+                f"'split_spectrum {stem}.PRM' (run from {case_root}/SLC) "
+                f"did not produce a valid {key} line -- check that command's "
+                f"own output/exit code by re-running it manually before "
+                f"retrying correct_iono=1."
+            )
         run(f"cp {master_prm} .")
         run(f"ln -sf {led_path} .")
         replace_strings(f"{stem}.PRM", "wavelength", f"radar_wavelength = {wl}")
