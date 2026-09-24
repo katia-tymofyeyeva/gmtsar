@@ -1,5 +1,68 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-24 (4): real heap-buffer-underflow in `split_spectrum.c`'s `cos_window()` -- a genuine, pre-existing C bug, not a Python port issue
+
+After the earlier fixes, `split_spectrum` itself crashed on real
+NISAR_CSAF data (`NSR_20260331A`) with `double free or corruption (out)`
+(exit 134/SIGABRT) partway through writing lines. Unlike every other bug
+found this week, this is in the **C binary itself**
+(`gmtsar/split_spectrum.c`), not the Python framework.
+
+Root cause: `cos_window()` builds a bandpass window into `filter[]`, a
+heap array of exactly `N` (`nffti`) doubles, using three loops whose
+start/end indices are derived from `nc`, `flat_nb`, `cos_nb` (all
+functions of the sub-band center frequency and bandwidth relative to the
+sampling rate). For some real parameter combinations -- confirmed on this
+exact scene -- `nc - flat_nb - cos_nb - 1` comes out negative, so the
+second loop starts writing at a negative index: `filter[-1]`,
+`filter[-2]`, ... -- a **heap-buffer-underflow**, writing a few doubles
+*before* the start of the `filterh`/`filterl` allocations. This doesn't
+crash immediately; it corrupts the allocator's bookkeeping for whatever
+chunk sits just before `filter[]` in memory, which only gets detected
+later when *that* chunk is `free()`'d -- explaining why the crash
+happened at the very end of the write loop, seemingly unrelated to
+`cos_window()`, which ran first and returned normally.
+
+Confirmed with a standalone AddressSanitizer harness (not the full GMTSAR
+build, which needs `gmt.h`/`tiffio.h` unavailable in this sandbox) built
+from `cos_window()`'s code verbatim: reproduced a real
+`heap-buffer-overflow ... 8 bytes to the left of` the `filter[]`
+allocation with `bc=50` (a tiny bandwidth relative to `fs`/`N`, which
+drives `nc` down near 0). Confirmed the reproduction is genuine (not a
+harness artifact) before writing the fix.
+
+Fixed by clamping each loop's start index to `>= 0` and adding an `i < N`
+guard to each loop's continuation condition -- eliminates the
+out-of-bounds write for any input, while leaving every write for
+already-in-bounds indices completely unchanged (verified: a realistic
+in-bounds case still produces `filter[nc] == 1.0` exactly as before).
+
+**Verification**: confirmed the original (unfixed) `cos_window()` code,
+extracted verbatim into a scratch harness, reproduces a real
+`heap-buffer-overflow ... 8 bytes to the left of` the `filter[]`
+allocation under ASan with `bc=50` -- before writing the fix. Added
+`gmtsar/tests/test_split_spectrum_cos_window.c`, a standalone (no
+`gmt.h`/`tiffio.h`/GMTSAR-build dependency) ASan harness with the FIXED
+`cos_window()` copied verbatim, covering the exact crash reproduction
+(`bc=50`), `nc==0` exactly, a realistic in-bounds NISAR-like bandwidth
+(regression check: `filter[nc] == 1.0` unchanged), and the `fs/3`
+boundary case. Build & run: `gcc -fsanitize=address -g -O0
+test_split_spectrum_cos_window.c -o /tmp/tcw -lm && /tmp/tcw` -- prints
+`ALL CASES PASSED` and exits 0. Confirmed passing.
+
+**This requires a rebuild, not just `git pull`** -- `split_spectrum` is a
+compiled C binary. `install.py --rebuild` is sufficient and is the right
+tool for this (simpler than a manual `cd gmtsar && make`): `do_build()`
+runs `make`/`make install` from the repo root, and GMTSAR's Makefile is
+recursive, so that one call recompiles anything under `gmtsar/` whose
+source changed -- including `split_spectrum.c` -- via normal Make
+dependency tracking, then re-stages the rebuilt binary into `<repo>/bin`.
+```
+python3 gmtsar/python/install.py --system conda --conda-env <env> --rebuild
+```
+Confirm the binary's mtime is newer than `split_spectrum.c` before
+re-running `correct_iono=1`.
+
 ## Fixed 2026-09-24 (3): `cleanup topo` deleted `trans.dat` before the reuse guard ever got a chance to run
 
 The user noticed `dem2topo_ra` still prints `no file trans.dat` on every

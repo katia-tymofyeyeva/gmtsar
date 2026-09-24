@@ -406,11 +406,33 @@ int cos_window(double fc, double fb, double fs, int N, double *filter) {
 	flat_nb = (int)round(nb / 4);
 	cos_nb = (int)round(nb / 4);
 
-	for (i = nc - flat_nb - 1; i < nc + flat_nb; i++)
+	// Found 2026-09-24: for some real PRM parameter combinations (seen on
+	// real NISAR data), nc/flat_nb/cos_nb work out such that these loops'
+	// start or end index falls outside [0, N) -- e.g. nc - flat_nb - 1 < 0,
+	// or nc + flat_nb + cos_nb > N. filter[] is a heap allocation of
+	// exactly N doubles (see split1()'s `malloc(nffti * sizeof(double))`),
+	// so writing outside that range corrupts adjacent heap chunks. The
+	// corruption itself doesn't crash immediately -- it only surfaced
+	// later as "double free or corruption (out)" (SIGABRT) when a nearby
+	// chunk was freed, far from this function, making it very hard to
+	// trace back here without reading the source. Clamping each loop's
+	// bounds to [0, N) fixes the out-of-bounds write without changing any
+	// value this function writes for indices that were already in range.
+	int i_start;
+
+	i_start = nc - flat_nb - 1;
+	if (i_start < 0) i_start = 0;
+	for (i = i_start; i < nc + flat_nb && i < N; i++)
 		filter[i] = 1;
-	for (i = nc - flat_nb - cos_nb - 1; i < nc - flat_nb - 1; i++)
+
+	i_start = nc - flat_nb - cos_nb - 1;
+	if (i_start < 0) i_start = 0;
+	for (i = i_start; i < nc - flat_nb - 1 && i < N; i++)
 		filter[i] = 0.5 - cos(PI * (i - (nc - flat_nb - cos_nb - 1) + 1) / cos_nb) / 2.0;
-	for (i = nc + flat_nb; i < nc + flat_nb + cos_nb; i++)
+
+	i_start = nc + flat_nb;
+	if (i_start < 0) i_start = 0;
+	for (i = i_start; i < nc + flat_nb + cos_nb && i < N; i++)
 		filter[i] = cos(PI * (i - (nc + flat_nb) + 1) / cos_nb) / 2.0 + 0.5;
 
 	if (fc < 0) {
