@@ -38,6 +38,12 @@ if str(_UTILS_DIR) not in sys.path:
 
 import gmtsar_lib  # noqa: E402
 
+# Captured before any test's setUp() overwrites gmtsar_lib.grep_value with
+# a mock -- test_prm_with_blank_wavelength_line_does_not_crash below needs
+# the REAL grep_value to reproduce its exact IndexError-on-blank-value
+# behavior, not a stand-in that might not match.
+_REAL_GREP_VALUE = gmtsar_lib.grep_value
+
 _spec = _ilu.spec_from_loader(
     "intf_batch_mod",
     _ilm.SourceFileLoader("intf_batch_mod", str(_UTILS_DIR / "intf_batch")),
@@ -287,6 +293,48 @@ mask_water = 0
                 any(c.startswith("split_spectrum") for c in run_cmds),
                 f"expected a re-split for a scene with a broken cached "
                 f"PRM, got: {run_cmds}",
+            )
+        finally:
+            os.chdir(cwd0)
+            shutil.rmtree(tmpdir)
+
+    def test_prm_with_blank_wavelength_line_does_not_crash(self):
+        """Real bug found 2026-09-24 running a fresh single-pair
+        batch_processing case: an SLC_H/SLC_L PRM left over from BEFORE
+        this whole fix existed can have a line like 'radar_wavelength = '
+        (key and '=' present, no value token at all -- not just a missing
+        line). The real gmtsar_lib.grep_value's `line.split()[i-1]` raises
+        a bare IndexError on that, which used to propagate straight out of
+        _prm_has_valid_wavelength and kill intf_batch entirely -- the
+        opposite of self-healing. Uses the REAL grep_value (not the mock)
+        against a real file to reproduce the exact crash."""
+        tmpdir = tempfile.mkdtemp()
+        cwd0 = os.getcwd()
+        try:
+            self._build_case(tmpdir, with_split_outputs=True)
+            with open(os.path.join(tmpdir, "SLC_H", "MASTER.PRM"), "w") as f:
+                f.write("radar_wavelength = \n")
+            gmtsar_lib.grep_value = _REAL_GREP_VALUE
+            intf_batch.grep_value = _REAL_GREP_VALUE
+            os.chdir(tmpdir)
+            self.calls.clear()
+            # Must not raise IndexError -- must detect the blank value as
+            # invalid and attempt a re-split instead. run() is mocked
+            # (doesn't actually execute split_spectrum), so params_MASTER
+            # never gets real content and the subsequent high_wavelength
+            # read legitimately fails loud with RuntimeError -- that's the
+            # already-covered test_split_scene_empty_wavelength_fails_loud
+            # path, not what this test is checking. What matters here is
+            # that a re-split was attempted at all (no IndexError before
+            # ever reaching it).
+            try:
+                intf_batch._iono_split_scene(tmpdir, "MASTER")
+            except RuntimeError:
+                pass
+            run_cmds = [c[1] for c in self.calls if c[0] == "run"]
+            self.assertTrue(
+                any(c.startswith("split_spectrum") for c in run_cmds),
+                f"expected a re-split attempt, got: {run_cmds}",
             )
         finally:
             os.chdir(cwd0)

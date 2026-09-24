@@ -130,7 +130,21 @@ def _iono_split_scene(case_root, stem):
     def _prm_has_valid_wavelength(prm_path):
         if not check_file_report(prm_path):
             return False
-        wl = grep_value(prm_path, "radar_wavelength", 3)
+        # grep_value itself is not safe to call on a PRM we already
+        # suspect might be broken: a line like "radar_wavelength = "
+        # (key and "=" present, no value token -- the exact on-disk shape
+        # left behind by the original, pre-2026-09-23 version of this bug)
+        # makes grep_value's `line.split()[i-1]` raise IndexError instead
+        # of returning "". Found 2026-09-24 running a fresh single-pair
+        # batch_processing case: that raw IndexError propagated out of
+        # _prm_has_valid_wavelength and killed intf_batch entirely,
+        # defeating the whole point of this check (deciding whether the
+        # cached PRM is safe to trust). Any failure to read a usable
+        # wavelength -- however it fails -- means "not valid, re-split".
+        try:
+            wl = grep_value(prm_path, "radar_wavelength", 3)
+        except (IndexError, ValueError, OSError):
+            return False
         return isinstance(wl, (int, float)) and wl != 0
 
     if (check_file_report(slc_h) and check_file_report(slc_l)
@@ -153,14 +167,23 @@ def _iono_split_scene(case_root, stem):
     led_path = os.path.join(case_root, "raw", f"{stem}.LED")
     for side, key in (("SLC_H", "high_wavelength"), ("SLC_L", "low_wavelength")):
         os.chdir(os.path.join(case_root, side))
-        wl = grep_value(params_path, key, 3)
         # grep_value/replace_strings never raise (matches the rest of this
-        # codebase's run() tolerance), so a failed split_spectrum call or a
-        # missing "{key}" line in params_path used to write silently as
-        # "radar_wavelength = " (empty) -- phasediff_py's PRM parser then
-        # skips the empty value, leaving lambda at its 0.0 default, which
-        # only surfaces ~15 minutes later as a ZeroDivisionError deep
-        # inside filter's real.grd/imag.grd step (found 2026-09-23 on real
+        # codebase's run() tolerance) -- except grep_value itself CAN raise
+        # IndexError if a matching line exists but has no value token
+        # (e.g. "high_wavelength = ", found 2026-09-24 on a leftover PRM
+        # from before this whole fix existed). Treat that the same as a
+        # missing line -- both mean "no usable value" -- rather than let
+        # the exception escape uncaught.
+        try:
+            wl = grep_value(params_path, key, 3)
+        except (IndexError, ValueError, OSError):
+            wl = ""
+        # A failed split_spectrum call or a missing "{key}" line in
+        # params_path used to write silently as "radar_wavelength = "
+        # (empty) -- phasediff_py's PRM parser then skips the empty value,
+        # leaving lambda at its 0.0 default, which only surfaces ~15
+        # minutes later as a ZeroDivisionError deep inside filter's
+        # real.grd/imag.grd step (found 2026-09-23 on real
         # NSR_20260331A/NSR_20260412A data). Fail loud here instead, right
         # where the actual cause is, per this project's no-silent-fallback
         # rule -- see PATHWAY_FORWARD.md.

@@ -1,5 +1,55 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-24 (2): the self-heal check itself could crash with `IndexError` instead of healing
+
+Immediately after the self-heal fix directly below, a fresh single-pair
+`batch_processing` run hit a NEW crash in the fix's own validation code:
+
+```
+File "intf_batch", line 133, in _prm_has_valid_wavelength
+    wl = grep_value(prm_path, "radar_wavelength", 3)
+File "gmtsar_lib.py", line 211, in grep_value
+    val = line.split()[i-1]
+IndexError: list index out of range
+```
+
+Root cause: `gmtsar_lib.grep_value`'s `line.split()[i-1]` assumes the
+matched line has at least `i` whitespace-separated tokens. A PRM left
+behind by the *original*, pre-2026-09-23 version of the `correct_iono`
+bug can have a line like `radar_wavelength = ` -- key and `=` present,
+but no value token at all (not merely a missing line, which
+`grep_value` already handled fine by leaving `val` at `""`). `line.split()`
+on that line is `["radar_wavelength", "="]` -- only 2 tokens -- so
+`[i-1]` with `i=3` raises `IndexError` instead of returning `""`.
+`_prm_has_valid_wavelength` called `grep_value` expecting it to return a
+value or `""`, not raise -- so the exception propagated straight out and
+killed `intf_batch` entirely, which is the opposite of what a self-heal
+check is for: the one file it's specifically meant to be checked *because
+it might be broken* is the one that crashed it.
+
+Fixed by wrapping both `grep_value` calls in `_iono_split_scene`
+(`_prm_has_valid_wavelength`'s own check, and the `high_wavelength`/
+`low_wavelength` read from `split_spectrum`'s output) in
+`try/except (IndexError, ValueError, OSError)`, treating any failure to
+read a usable value the same as reading an explicitly blank one: "not
+valid, re-split" for the cache check, and the existing 2026-09-23
+fail-loud `RuntimeError` for the `split_spectrum` output read.
+
+**Not fixed** (deliberately out of scope): `gmtsar_lib.grep_value`'s
+`line.split()[i-1]` is a general landmine used throughout this codebase
+wherever a PRM/params file might have a key with a missing value --
+fixing every call site is a much larger, separate audit. This entry only
+hardens the two call sites this feature itself introduced.
+
+**Verification**: added `test_prm_with_blank_wavelength_line_does_not_crash`
+to `bin_py/tests/test_intf_batch_iono.py` -- unlike the other tests in
+that file, it uses the REAL `gmtsar_lib.grep_value` (captured before
+`setUp()` overwrites it with a mock) against a real on-disk PRM
+containing `"radar_wavelength = \n"`, to reproduce the exact crash rather
+than a stand-in that might not match. Confirmed the crash is real and
+reproducible standalone (`grep_value` on that exact line raises
+`IndexError`) before writing the fix. All 8 tests in the file pass.
+
 ## Fixed 2026-09-24: `_iono_split_scene`'s "already split" cache could never self-heal from the 2026-09-23 bug
 
 The 2026-09-23 fix (below) stopped a failed `split_spectrum` from writing
