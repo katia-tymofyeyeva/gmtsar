@@ -72,6 +72,14 @@ class TestIntfBatchIono(unittest.TestCase):
                 return 0.25
             if s == "low_wavelength":
                 return 0.23
+            if s == "radar_wavelength":
+                # Only scenes actually split via split_spectrum (or a test
+                # explicitly writing a valid PRM under with_split_outputs)
+                # should have a usable radar_wavelength -- everything else
+                # in this suite never reaches _prm_has_valid_wavelength's
+                # check with a file present, so this branch only matters
+                # for test_already_split_scene_is_skipped below.
+                return 0.24
             return 0
 
         def fake_check_file_report(fn):
@@ -109,6 +117,12 @@ class TestIntfBatchIono(unittest.TestCase):
         if with_split_outputs:
             open(os.path.join(tmpdir, "SLC_H", "MASTER.SLC"), "w").close()
             open(os.path.join(tmpdir, "SLC_L", "MASTER.SLC"), "w").close()
+            # A previously-completed split also leaves a PRM behind; must
+            # exist for _prm_has_valid_wavelength's check_file_report call
+            # (its "valid" value comes from fake_grep_value's radar_
+            # wavelength branch above, not from this file's contents).
+            open(os.path.join(tmpdir, "SLC_H", "MASTER.PRM"), "w").close()
+            open(os.path.join(tmpdir, "SLC_L", "MASTER.PRM"), "w").close()
         intf_in = os.path.join(tmpdir, "intf.in")
         with open(intf_in, "w") as f:
             f.write("MASTER:REP1\nMASTER:REP2\n")
@@ -237,6 +251,43 @@ mask_water = 0
                 intf_batch._iono_split_scene(tmpdir, "MASTER")
             self.assertIn("high_wavelength", str(ctx.exception))
             self.assertIn("split_spectrum", str(ctx.exception))
+        finally:
+            os.chdir(cwd0)
+            shutil.rmtree(tmpdir)
+
+    def test_stale_broken_split_scene_is_repaired(self):
+        """Real bug found 2026-09-24 on NSR_20251225A/NSR_20260106A: the
+        idempotency check only looked for SLC_H/SLC_L .SLC files, so a
+        scene split by a run from BEFORE the 2026-09-23 fix (which has the
+        .SLC files but a PRM with a blank radar_wavelength) was trusted as
+        'already split' forever -- reproducing the same ZeroDivisionError
+        on every future run with no way to self-heal. _iono_split_scene
+        must now detect the invalid PRM and re-split (overwrite) it."""
+        tmpdir = tempfile.mkdtemp()
+        cwd0 = os.getcwd()
+        try:
+            self._build_case(tmpdir, with_split_outputs=True)
+            # Simulate the pre-fix broken state: .SLC exists, but the PRM
+            # has no usable radar_wavelength (grep_value returns 0 for it).
+            def fake_grep_value_broken(fn, s, i):
+                self.calls.append(("grep_value", fn, s, i))
+                if s == "high_wavelength":
+                    return 0.25
+                if s == "low_wavelength":
+                    return 0.23
+                return 0  # radar_wavelength (and everything else) invalid
+
+            gmtsar_lib.grep_value = fake_grep_value_broken
+            intf_batch.grep_value = fake_grep_value_broken
+            os.chdir(tmpdir)
+            self.calls.clear()
+            intf_batch._iono_split_scene(tmpdir, "MASTER")
+            run_cmds = [c[1] for c in self.calls if c[0] == "run"]
+            self.assertTrue(
+                any(c.startswith("split_spectrum") for c in run_cmds),
+                f"expected a re-split for a scene with a broken cached "
+                f"PRM, got: {run_cmds}",
+            )
         finally:
             os.chdir(cwd0)
             shutil.rmtree(tmpdir)

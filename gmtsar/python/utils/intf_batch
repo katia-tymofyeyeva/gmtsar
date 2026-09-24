@@ -112,9 +112,36 @@ def _iono_split_scene(case_root, stem):
     flagged as such in PATHWAY_FORWARD.md."""
     slc_h = os.path.join(case_root, "SLC_H", f"{stem}.SLC")
     slc_l = os.path.join(case_root, "SLC_L", f"{stem}.SLC")
-    if check_file_report(slc_h) and check_file_report(slc_l):
+    slc_h_prm = os.path.join(case_root, "SLC_H", f"{stem}.PRM")
+    slc_l_prm = os.path.join(case_root, "SLC_L", f"{stem}.PRM")
+    # Fixed 2026-09-24: this idempotency check used to only look for the
+    # .SLC files, not whether their PRMs actually carry a usable
+    # radar_wavelength. Scenes split by a run from BEFORE the 2026-09-23
+    # fix (which made an empty high_wavelength/low_wavelength value raise
+    # loud instead of writing a blank radar_wavelength) already have their
+    # SLC_H/SLC_L .SLC files on disk with a broken PRM -- so this check
+    # would trust them as "already split" forever and keep reproducing the
+    # exact same ZeroDivisionError on every future run, for every pair
+    # that references that scene, with no way to self-heal (found on
+    # NSR_20251225A/NSR_20260106A, a different scene pair than the
+    # original report -- same underlying stale-PRM cause). Now also
+    # validates the PRM before trusting the cache; re-splits (overwriting)
+    # if it's missing or still blank.
+    def _prm_has_valid_wavelength(prm_path):
+        if not check_file_report(prm_path):
+            return False
+        wl = grep_value(prm_path, "radar_wavelength", 3)
+        return isinstance(wl, (int, float)) and wl != 0
+
+    if (check_file_report(slc_h) and check_file_report(slc_l)
+            and _prm_has_valid_wavelength(slc_h_prm)
+            and _prm_has_valid_wavelength(slc_l_prm)):
         print(f"IONO: {stem} already split into SLC_H/SLC_L -- skipping")
         return
+    if check_file_report(slc_h) or check_file_report(slc_l):
+        print(f"IONO: {stem}'s existing SLC_H/SLC_L split has an invalid "
+              f"radar_wavelength (likely written by a run before the "
+              f"2026-09-23 fix) -- re-splitting to repair it")
     print(f"IONO: splitting {stem} into high/low sub-bands")
     os.chdir(os.path.join(case_root, "SLC"))
     params_file = f"params_{stem}"

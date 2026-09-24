@@ -1,5 +1,71 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-24: `_iono_split_scene`'s "already split" cache could never self-heal from the 2026-09-23 bug
+
+The 2026-09-23 fix (below) stopped a failed `split_spectrum` from writing
+a blank `radar_wavelength` silently -- but only for *scenes split after
+that fix landed*. `_iono_split_scene`'s idempotency check only looked for
+`SLC_H/<stem>.SLC` and `SLC_L/<stem>.SLC` -- not whether their PRMs
+actually carry a usable `radar_wavelength`. Any scene already split by a
+run from *before* the fix has those `.SLC` files sitting on disk next to
+a PRM with a blank `radar_wavelength`, so the check trusted it as
+"already split" and skipped re-splitting it -- forever. Confirmed on real
+data: the exact same `ZeroDivisionError` recurred on 2026-09-24 for
+`NSR_20251225A`/`NSR_20260106A`, a *different* scene pair than the
+original 2026-09-23 report, well after that fix was committed and pulled.
+
+Fixed by having `_iono_split_scene` also validate both PRMs
+(`_prm_has_valid_wavelength`: file exists and `radar_wavelength` parses as
+nonzero) before trusting the cache; if either is missing or still blank,
+it re-splits and overwrites, self-healing instead of failing the same way
+forever.
+
+**If you've already hit this**: any scene that failed with this
+`ZeroDivisionError` before pulling this fix has a broken `SLC_H`/`SLC_L`
+PRM sitting on disk right now. You do NOT need to manually delete
+anything -- the next `intf_batch` run will detect the invalid
+`radar_wavelength` and re-split that scene automatically.
+
+**Verification**: added `test_stale_broken_split_scene_is_repaired` to
+`bin_py/tests/test_intf_batch_iono.py` (simulates the pre-fix broken
+on-disk state -- `.SLC` present, `radar_wavelength` invalid -- and asserts
+`_iono_split_scene` re-runs `split_spectrum` instead of skipping). All 7
+tests in that file pass.
+
+## Built 2026-09-23: `dem2topo_ra` reuses an existing `trans.dat` instead of always recomputing it
+
+The user flagged that `gmt grd2xyz --FORMAT_FLOAT_OUT=%lf dem.grd -s |
+SAT_llt2rat_py master.PRM 0 -bod > trans.dat` took 15+ minutes on real
+NISAR_CSAF data, and `intf_batch` calls `dem2topo_ra` unconditionally at
+the top of every run (before the pairs loop) -- so simply re-running step
+4 to pick up an unrelated change (e.g. adding `correct_iono=1`) redoes
+this every time, even though `trans.dat` hasn't actually changed.
+
+There's already precedent for skipping this exact step elsewhere in the
+codebase: `merge_unwrap_geocode_tops` does `if not
+check_file_report("trans.dat"): ...`. But a bare existence check isn't
+enough here -- `trans.dat` is a pure function of `master.PRM` (orbit/
+geometry fields) and `dem.grd`; if either changes (a new DEM, a re-aligned
+master) after `trans.dat` was written, reusing it silently produces a
+wrong `topo_ra.grd` with no error at all -- exactly the class of quiet-
+wrong-answer bug this whole project has been chasing all session, just
+pointed the other direction (trusting a stale cache instead of missing a
+file). So `dem2topo_ra` now also requires `trans.dat`'s mtime to be `>=`
+both `master.PRM`'s and `dem.grd`'s before reusing it; otherwise it
+recomputes exactly as before. Deleting `topo/trans.dat` by hand still
+forces a recompute at any time.
+
+**Verification**: `python3 -m py_compile utils/dem2topo_ra` passes.
+`dem2topo_ra()` is one large monolithic function (needs real PRM fields,
+a real `dem.grd`, and further real `gmt` calls this sandbox can't run --
+same situation as `geocode`'s `ph_iono_ll.grd` change below), so rather
+than claim integration coverage that doesn't exist, added
+`bin_py/tests/test_dem2topo_ra_trans_dat_cache.py`, which isolates the
+exact reuse-decision expression added and exercises it against real files
+with controlled mtimes: no `trans.dat` -> recompute, fresh `trans.dat` ->
+reused, `trans.dat` older than `dem.grd` -> recompute, `trans.dat` older
+than `master.PRM` -> recompute, identical mtimes -> reused. All 5 pass.
+
 ## Fixed 2026-09-23: `correct_iono` silently wrote a blank `radar_wavelength`, surfacing as a `ZeroDivisionError` ~15 minutes later inside `filter`
 
 Real failure from the user's first full `correct_iono=1` run on real

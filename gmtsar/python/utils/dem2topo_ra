@@ -857,11 +857,39 @@ def dem2topo_ra():
     # The 9 sub-ULP bugs Mira #2 fixed to close parity were documented in
     # docs/audits/AUDIT_SAT_llt2rat_py.md, removed in the v2.7.1 doc
     # cleanup (recoverable from git history if needed).
-    with _dem2topo_phase("grd2xyz_SAT_llt2rat"):
-        if SC == 10 or SC == 11:
-            run('gmt grd2xyz --FORMAT_FLOAT_OUT=%lf '+sys.argv[2]+' -s | SAT_llt2rat_py '+sys.argv[1]+' 1 -bod > trans.dat')
-        else:
-            run('gmt grd2xyz --FORMAT_FLOAT_OUT=%lf '+sys.argv[2]+' -s | SAT_llt2rat_py '+sys.argv[1]+' 0 -bod > trans.dat')
+    # Added 2026-09-23 at the user's request: this grd2xyz|SAT_llt2rat_py
+    # pipe took ~15+ minutes on real NISAR_CSAF data, and dem2topo_ra is
+    # called unconditionally on every intf_batch run (even a re-run that
+    # only adds correct_iono=1 on top of an already-completed step 4) --
+    # see PATHWAY_FORWARD.md. trans.dat is a pure function of sys.argv[1]
+    # (master.PRM's geometry/orbit fields) and sys.argv[2] (dem.grd), so
+    # it's safe to reuse IF NEITHER HAS CHANGED since it was written.
+    # A bare existence check isn't enough -- a stale trans.dat left over
+    # from a different DEM or a re-aligned master.PRM would silently
+    # produce a wrong topo_ra.grd, which is exactly the class of silent-
+    # wrong-answer bug this whole project has been hunting all session,
+    # just pointed the other way (trusting a cache instead of a missing
+    # file). So this also requires trans.dat to be newer than both inputs;
+    # otherwise it recomputes exactly as before.
+    _trans_dat_prm = sys.argv[1]
+    _trans_dat_dem = sys.argv[2]
+    _reuse_trans_dat = (
+        check_file_report("trans.dat")
+        and os.path.getmtime("trans.dat") >= os.path.getmtime(_trans_dat_prm)
+        and os.path.getmtime("trans.dat") >= os.path.getmtime(_trans_dat_dem)
+    )
+    if _reuse_trans_dat:
+        print("DEM2TOPO_RA: trans.dat already exists and is newer than "
+              f"both {_trans_dat_prm} and {_trans_dat_dem} -- reusing it "
+              "instead of re-running grd2xyz | SAT_llt2rat_py. Delete "
+              "topo/trans.dat yourself to force a recompute (e.g. after "
+              "changing the DEM or re-aligning the master).")
+    else:
+        with _dem2topo_phase("grd2xyz_SAT_llt2rat"):
+            if SC == 10 or SC == 11:
+                run('gmt grd2xyz --FORMAT_FLOAT_OUT=%lf '+sys.argv[2]+' -s | SAT_llt2rat_py '+sys.argv[1]+' 1 -bod > trans.dat')
+            else:
+                run('gmt grd2xyz --FORMAT_FLOAT_OUT=%lf '+sys.argv[2]+' -s | SAT_llt2rat_py '+sys.argv[1]+' 0 -bod > trans.dat')
     
     print(' ')
     print('DEM2TOPO_RA: use an azimuth spacing of 2 for low PRF data such as S1 TOPS ... ...')
