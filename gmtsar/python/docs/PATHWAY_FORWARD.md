@@ -1,5 +1,32 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-24 (3): `cleanup topo` deleted `trans.dat` before the reuse guard ever got a chance to run
+
+The user noticed `dem2topo_ra` still prints `no file trans.dat` on every
+single run, even after the earlier-today caching fix. Traced it: `_topo_stage`
+(intf_batch's stage-1 helper) unconditionally runs `run("cleanup topo")` as
+its very first line, every time -- and `cleanup topo` deletes every file in
+`topo/` except `dem.grd`, including `trans.dat` and `topo_ra.grd`. So the
+file is already gone by the time `dem2topo_ra`'s reuse check ever looks
+for it. This predates every change made today; it's the original design,
+sensible for the old one-shot workflow, but it means the trans.dat caching
+added earlier today was effectively dead code inside `intf_batch` itself
+(it still helps `dem2topo_ra`'s other callers, like `merge_unwrap_geocode_tops`'s
+own pattern, which don't clean topo/ first).
+
+Per the user's standing instruction not to change how existing
+interferograms are produced without opting in, this is a new config key,
+default off: `reuse_topo` (default `0`) preserves the exact prior
+behavior -- `cleanup topo` still runs every time. Setting `reuse_topo = 1`
+skips that one command, letting `dem2topo_ra`'s own mtime check (still
+requiring `trans.dat` to be newer than both `master.PRM` and `dem.grd`)
+decide whether to reuse it.
+
+**Verification**: added `test_reuse_topo_unset_still_runs_cleanup_topo`
+(regression guard: unset must still run `cleanup topo`, byte-for-byte) and
+`test_reuse_topo_1_skips_cleanup_topo` to `bin_py/tests/test_intf_batch_iono.py`.
+All 10 tests in the file pass.
+
 ## Fixed 2026-09-24 (2): the self-heal check itself could crash with `IndexError` instead of healing
 
 Immediately after the self-heal fix directly below, a fresh single-pair

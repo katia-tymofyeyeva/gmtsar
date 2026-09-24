@@ -31,9 +31,27 @@ def _get_config(path, key, default=""):
     return default
 
 
-def _topo_stage(master, SAT, topo_phase, shift_topo):
-    """Stage 1: make topo_ra (+ optional topo_shift)."""
-    run("cleanup topo")
+def _topo_stage(master, SAT, topo_phase, shift_topo, reuse_topo=0):
+    """Stage 1: make topo_ra (+ optional topo_shift).
+
+    reuse_topo (added 2026-09-24, default 0 = unchanged prior behavior):
+    `cleanup topo` unconditionally deletes every file in topo/ except
+    dem.grd on every single intf_batch run -- including trans.dat and
+    topo_ra.grd -- which is why dem2topo_ra's trans.dat reuse guard
+    (added earlier the same day) never actually got a chance to fire: the
+    file was already gone by the time it checked. That cleanup makes
+    sense for the original one-shot workflow, but conflicts with wanting
+    to re-run step 4 to pick up an unrelated change (e.g. correct_iono)
+    without redoing the ~15+ minute grd2xyz|SAT_llt2rat_py pipe every
+    time. Rather than silently change what every existing case does,
+    this is opt-in via config (reuse_topo=1) -- default 0 means
+    byte-for-byte the same cleanup-then-regenerate behavior as before."""
+    if reuse_topo:
+        print("TOPO: reuse_topo=1 -- skipping 'cleanup topo' so an "
+              "existing trans.dat/topo_ra.grd can be reused if still "
+              "valid (see dem2topo_ra's own mtime check).")
+    else:
+        run("cleanup topo")
     if topo_phase == 0:
         print("NO TOPOPHASE IS SUBSTRACTED")
         return
@@ -373,6 +391,9 @@ def intf_batch():
     defomax           = int(_get_config(config, "defomax", "0") or 0)
     near_interp       = int(_get_config(config, "near_interp", "0") or 0)
     mask_water        = int(_get_config(config, "mask_water", "0") or 0)
+    # Added 2026-09-24 (see _topo_stage's docstring) -- default 0 keeps the
+    # exact prior behavior (cleanup topo runs every time, unconditionally).
+    reuse_topo        = int(_get_config(config, "reuse_topo", "0") or 0)
 
     # correct_iono support added 2026-09-21 (see _iono_split_scene's
     # docstring) -- defaults to 0/off, at which point every line below is
@@ -405,7 +426,7 @@ def intf_batch():
         }
 
     if stage <= 1:
-        _topo_stage(master, SAT, topo_phase, shift_topo)
+        _topo_stage(master, SAT, topo_phase, shift_topo, reuse_topo)
 
     if stage <= 2:
         print("\nSTART FORM A STACK OF INTERFEROGRAMS")

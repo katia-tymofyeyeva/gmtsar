@@ -186,6 +186,27 @@ mask_water = 0
         self.assertTrue(any("intf MASTER.PRM REP1.PRM" in c for c in run_cmds))
         self.assertTrue(any(c.startswith("geocode") for c in run_cmds))
 
+    def test_reuse_topo_unset_still_runs_cleanup_topo(self):
+        """Regression guard: reuse_topo defaulting to 0/unset must be
+        byte-for-byte the prior behavior -- 'cleanup topo' runs every
+        time, exactly like before this option existed."""
+        calls = self._run_case("")
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        self.assertIn("cleanup topo", run_cmds)
+
+    def test_reuse_topo_1_skips_cleanup_topo(self):
+        """Real issue found 2026-09-24: 'cleanup topo' unconditionally
+        deletes trans.dat/topo_ra.grd on every intf_batch run, so
+        dem2topo_ra's trans.dat reuse guard (added earlier the same day)
+        never got a chance to fire. reuse_topo=1 is the opt-in escape
+        hatch -- skips 'cleanup topo' so an existing, still-valid
+        trans.dat can survive a re-run."""
+        calls = self._run_case("reuse_topo = 1\n")
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        self.assertNotIn("cleanup topo", run_cmds)
+        # Everything else must still happen -- this only skips one command.
+        self.assertTrue(any("dem2topo_ra" in c for c in run_cmds), run_cmds)
+
     def test_correct_iono_1_default_skip_est_splits_once_per_scene(self):
         """3 unique scenes across 2 pairs -> exactly 3 split_spectrum calls
         (not 4), 6 iono filter calls (2 pairs x 3 sides), no estimate call
