@@ -1,5 +1,130 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-09-28: `install.py` now auto-provisions `csh` for `--system conda` -- no more manual tcsh symlink
+
+The user asked whether the recurring "install tcsh via conda + symlink
+it as csh" manual workaround (needed every time a fresh host hit the
+missing-`csh` problem -- most recently the `proj_ll2ra.csh` /
+`landmask` cascade above) could be folded into `install.py` itself so it
+never has to be done by hand again.
+
+This needed two separate halves, not one:
+
+**Half 1 -- provision `csh` itself.** `csh` has no ABI/linkage
+implications for the rest of the build (nothing links against it --
+it's an interpreter, invoked, not compiled against), exactly the same
+reasoning that already justified bootstrapping `flex` via conda-forge
+even in plain `--system conda` mode (see `do_conda_setup`'s docstring).
+So `tcsh` (there is no plain `csh` package on conda-forge) is now in
+`CONDA_FORGE_BOOTSTRAP_PACKAGES` unconditionally, and
+`_ensure_csh_symlink()` (extracted from `_check_conda_full_isolation_tools`,
+which already did this for `--system conda-linux-full` -- now shared by
+both modes from a single call site in `do_conda_setup`) creates a
+`csh -> tcsh` symlink inside the conda env's `bin/`.
+
+**Half 2 -- the part that's easy to miss.** Half 1 alone does NOT fix the
+actual crash in the log above. `proj_ll2ra.csh` (and ~90 other
+`gmtsar/csh/*.csh` scripts) hardcode `#!/bin/csh` as their shebang -- an
+absolute path the kernel `execve()`s directly when the script is run
+directly (`./proj_ll2ra.csh`), never consulting `PATH` at all. A `csh`
+symlink living only inside the conda env's `bin/` is invisible to that
+lookup. No amount of conda-provisioning or `PATH` manipulation can make
+a hardcoded absolute-path shebang resolve anywhere else -- the only way
+around it without editing every script's shebang is making `/bin/csh`
+literally exist, which needs root on most hosts and would defeat
+`--system conda`'s entire no-sudo premise.
+
+Fixed with a new `_patch_csh_shebangs()`, called from `do_build()`:
+rewrites every `gmtsar/csh/*.csh` and `gmtsar/python/csh_shims/*.csh`
+script's `#!/bin/csh` (preserving any trailing flags, e.g. `-f`) to
+`#!/usr/bin/env -S csh` -- PATH-resolvable, so it finds the Half 1
+symlink once the conda env's `bin/` is on `PATH` (already required for
+`gmt` itself to resolve, per the existing `conda activate <env>`
+instruction printed at the end of a run -- zero extra steps for the
+user). Uses `env -S` (GNU coreutils >= 8.30) rather than plain
+`env csh -f`, because the kernel's shebang parsing hands the interpreter
+everything after the path as ONE opaque argument string with no further
+word-splitting -- `#!/usr/bin/env csh -f` would make `env` look for an
+executable literally named `"csh -f"`. `-S` is `env`'s own documented
+mechanism for exactly this multi-argument-shebang case.
+
+This is a small, purely mechanical, identically-applied transformation
+across ~90 files -- the same category of build-time in-place fix as the
+existing `_defuse_fake_lex_sources()` (renames stray `.l` files), not
+`C_FIXES`' static full-content overlay (reserved for genuinely
+hand-crafted patches to a couple of specific files -- copying ~90 files'
+entire content into `gmtsar/python/c_fixes/` just to change one line
+each would be an unmaintainable amount of drift from upstream).
+Idempotent: confirmed a second run is a no-op.
+
+`csh` also came out of `REQUIRED_SYSTEM_BUILD_TOOLS` (the hard-fail
+check `--system conda` runs up front) -- it would otherwise now be a
+false negative, rejecting a host that builds fine once
+`do_conda_setup`/`do_build` actually run.
+
+**Verification**: confirmed `env -S echo -n` actually re-splits and
+execs as intended on a real shell (GNU coreutils 8.32) before relying on
+it. Added 4 tests to `bin_py/tests/test_install_config.py`:
+`test_tcsh_bootstrapped_via_conda_not_required_system_tool` (tcsh in
+bootstrap packages, csh out of the hard-fail list),
+`test_ensure_csh_symlink_called_from_do_conda_setup`,
+`test_patch_csh_shebangs_called_from_do_build`, and
+`test_patch_csh_shebangs_rewrites_real_repo_scripts` (end-to-end against
+scratch files shaped like the real scripts -- hardcoded shebang with/
+without flags, an already-patched one left alone, a non-csh script left
+alone, content after the shebang line untouched, idempotent on a second
+run). All pass, alongside the full pre-existing `test_install_config.py`
+static suite (12 parameterless tests unaffected).
+
+## Fixed 2026-09-28: two more real bugs surfaced running a full `correct_iono=1` pair after the `cos_window()` fix
+
+With `split_spectrum` fixed and rebuilt, the user ran a real single-pair
+`correct_iono=1` case (`iono_skip_est=0`, `range_dec=azimuth_dec=4`) and
+hit two more real, previously-unexercised bugs.
+
+**(1) `gmt_xyz2grd_py.py`'s `_parse_inc` rejected GMT's own collapsed
+`-I<inc>` shorthand.** `gmt grdinfo -I` emits `-I<xinc>/<yinc>` normally,
+but collapses to the single-value shorthand `-I<inc>` (no slash)
+whenever `x_inc == y_inc`. The iono filter step's `range_dec`/
+`azimuth_dec` were both set to 4, so `phase_patch.grd`'s x_inc and y_inc
+came out equal, triggering exactly this shorthand -- which the original
+regex (`^-I([-+0-9.eE]+)/([-+0-9.eE]+)$`, slash required) rejected
+outright, raising `ValueError` inside `snaphu.py`'s `xyz2grd_file` call
+and killing that side's `snaphu_interp`. The main (non-iono) path had
+never hit this because its own dec/az_lks are normally unequal. Fixed by
+making the second `/<yinc>` group optional, defaulting `y_inc = x_inc`
+when absent. New test `test_parse_inc_collapsed_shorthand` in
+`bin_py/tests/test_gmt_xyz2grd_py.py`; all 5 tests in `TestParsing` pass.
+
+**(2) `_iono_one_pair` never copied a `params1` file into `intf_h`, so
+`estimate_ionospheric_phase` crashed with a bare `FileNotFoundError`.**
+`estimate_ionospheric_phase` reads `center_freq`/`high_freq`/`low_freq`
+from `{intf_h}/params1` (its own source, and matching the csh reference
+`p2p_processing_nsr.csh`, which does `cp ../../SLC/params* .` into
+`intf_h`/`intf_l` right after linking the PRM/LED, before ever calling
+`intf`). This fork's `_iono_split_scene` writes that same
+`split_spectrum` output as `SLC/params_<stem>` (keyed by scene, shared
+across every pair referencing it) instead of the csh's per-pair
+`params1`/`params2` -- but nothing ever copied it into `intf_h`.
+`estimate_ionospheric_phase` only ever reads `params1` (never reads
+`params2` from `intf_l` or anything from `intf_o`), so the fix only needs
+to copy the ref scene's `SLC/params_<ref>` into `intf_h/params1`, and only
+when `iono_skip_est == 0` (the only mode that calls
+`estimate_ionospheric_phase` at all). New tests
+`test_correct_iono_1_skip_est_0_copies_params1_into_intf_h` and
+`test_correct_iono_1_default_skip_est_never_copies_params1` in
+`bin_py/tests/test_intf_batch_iono.py`; all 12 tests in that file pass.
+
+**Not a code bug -- environment**: the same run also hit
+`/bin/sh: .../proj_ll2ra.csh: /bin/csh: bad interpreter: No such file or
+directory`, cascading into `landmask`'s `IndexError` and downstream
+`snaphu`/`corr_patch.grd` failures. This is the same missing-`csh`
+environment issue documented earlier (see the runbook / the
+`install.py` conda-env entries above) -- `csh` isn't present on this
+particular host/session. Fix is environmental, not a code change:
+`conda install -n <env> -c conda-forge tcsh -y` then
+`ln -sf "$(command -v tcsh)" "$(dirname "$(command -v tcsh)")/csh"`.
+
 ## Fixed 2026-09-24 (4): real heap-buffer-underflow in `split_spectrum.c`'s `cos_window()` -- a genuine, pre-existing C bug, not a Python port issue
 
 After the earlier fixes, `split_spectrum` itself crashed on real

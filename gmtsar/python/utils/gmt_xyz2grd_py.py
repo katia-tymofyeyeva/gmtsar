@@ -110,7 +110,15 @@ _Z_DTYPE = {
 _REGION_RE = re.compile(
     r"^-R([-+0-9.eE]+)/([-+0-9.eE]+)/([-+0-9.eE]+)/([-+0-9.eE]+)$"
 )
-_INC_RE = re.compile(r"^-I([-+0-9.eE]+)/([-+0-9.eE]+)$")
+# GMT's own `gmt grdinfo -I` collapses to the single-value shorthand
+# "-I<inc>" (no slash) whenever x_inc == y_inc, rather than always
+# emitting "-I<inc>/<inc>". Found 2026-09-25 on real NISAR_CSAF data: the
+# correct_iono filter step uses equal range_dec/azimuth_dec (e.g. 4/4),
+# which makes phase_patch.grd's x_inc == y_inc, triggering exactly this
+# shorthand -- "-I4" -- which the original xinc/yinc-only regex rejected
+# outright, crashing snaphu.py's xyz2grd_file call. The main (non-iono)
+# path never hit this because its dec/az_lks are normally unequal.
+_INC_RE = re.compile(r"^-I([-+0-9.eE]+)(?:/([-+0-9.eE]+))?$")
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +138,15 @@ def _parse_region(par1: str) -> Tuple[float, float, float, float]:
 
 
 def _parse_inc(par2: str) -> Tuple[float, float]:
-    """Parse ``-Ixinc/yinc`` -> ``(x_inc, y_inc)``."""
+    """Parse ``-Ixinc/yinc`` -> ``(x_inc, y_inc)``. Also accepts GMT's
+    collapsed ``-Iinc`` shorthand (x_inc == y_inc) -- see _INC_RE."""
     m = _INC_RE.match(par2.strip())
     if m is None:
         raise ValueError(
-            f"par2 does not match -I<xinc>/<yinc>: {par2!r}"
+            f"par2 does not match -I<xinc>/<yinc> or -I<inc>: {par2!r}"
         )
-    x_inc, y_inc = (float(v) for v in m.groups())
+    x_inc = float(m.group(1))
+    y_inc = float(m.group(2)) if m.group(2) is not None else x_inc
     return x_inc, y_inc
 
 

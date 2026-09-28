@@ -234,6 +234,39 @@ mask_water = 0
         grdmath_calls = [c for c in run_cmds if "grdmath" in c and "phasefilt_non_corrected" in c]
         self.assertEqual(len(grdmath_calls), 2)
 
+    def test_correct_iono_1_skip_est_0_copies_params1_into_intf_h(self):
+        """Real bug found 2026-09-25 on real NISAR_CSAF data:
+        estimate_ionospheric_phase reads center_freq/high_freq/low_freq
+        from "{intf_h}/params1" (matching the csh reference, which does
+        `cp ../../SLC/params* .` into intf_h/intf_l before ever calling
+        intf) -- but nothing ever copied this fork's SLC/params_<stem>
+        into intf_h, so estimate_ionospheric_phase crashed with a bare
+        FileNotFoundError on ../intf_h/params1. _iono_one_pair must copy
+        the ref scene's params file into intf_h/params1 -- and only into
+        intf_h (estimate_ionospheric_phase never reads params1 from
+        intf_l or intf_o), and only when iono_skip_est=0 (the only mode
+        that calls estimate_ionospheric_phase at all)."""
+        calls = self._run_case(
+            "correct_iono = 1\nrange_dec = 8\nazimuth_dec = 8\niono_skip_est = 0\n"
+        )
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        params1_copies = [c for c in run_cmds if c.startswith("cp") and c.endswith(" params1")]
+        # 2 pairs (MASTER:REP1, MASTER:REP2), one params1 copy each, only
+        # for the intf_h side.
+        self.assertEqual(len(params1_copies), 2, params1_copies)
+        for c in params1_copies:
+            self.assertIn("params_MASTER", c, c)
+
+    def test_correct_iono_1_default_skip_est_never_copies_params1(self):
+        """iono_skip_est defaults to 1 -- estimate_ionospheric_phase is
+        never called, so params1 must never be copied either (it would be
+        dead work at best, and _iono_split_scene's params_<stem> file may
+        not even exist yet in that mode for every scene)."""
+        calls = self._run_case("correct_iono = 1\nrange_dec = 8\nazimuth_dec = 8\n")
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        params1_copies = [c for c in run_cmds if c.endswith(" params1")]
+        self.assertEqual(params1_copies, [])
+
     def test_correct_iono_1_without_range_dec_fails_loud(self):
         tmpdir = tempfile.mkdtemp()
         try:

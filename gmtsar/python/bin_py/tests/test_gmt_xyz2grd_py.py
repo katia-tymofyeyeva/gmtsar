@@ -211,6 +211,18 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_parse_inc("-I0.000277778/0.000277778"),
                          (0.000277778, 0.000277778))
 
+    def test_parse_inc_collapsed_shorthand(self):
+        """Real bug found 2026-09-25 on real NISAR_CSAF data: `gmt grdinfo
+        -I` emits the collapsed "-I<inc>" shorthand (no slash) whenever
+        x_inc == y_inc, rather than always "-I<inc>/<inc>". correct_iono's
+        filter step uses equal range_dec/azimuth_dec (e.g. 4/4), so
+        phase_patch.grd's x_inc == y_inc there -- triggering this
+        shorthand and crashing snaphu.py's xyz2grd_file call with the
+        original xinc/yinc-only regex. Must parse to equal x_inc/y_inc."""
+        self.assertEqual(_parse_inc("-I4"), (4.0, 4.0))
+        self.assertEqual(_parse_inc("-I0.000277778"),
+                         (0.000277778, 0.000277778))
+
     def test_parse_region_bad(self):
         with self.assertRaises(ValueError):
             _parse_region("-Rgarbage")

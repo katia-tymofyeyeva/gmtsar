@@ -28,15 +28,15 @@ Miniconda/Anaconda):
                 (default: 'gmtsar'). If the env doesn't exist yet, it's
                 created via `conda create -c conda-forge gmt hdf5
                 libtiff liblapack ...` (network required, also
-                bootstraps flex -- see do_conda_setup's docstring for
-                why flex specifically is conda-provisioned rather than
-                assumed). Still assumes the system already has basic
-                build tools (gfortran, g++, make, autoconf, csh,
-                ghostscript) -- --system conda deliberately keeps the
-                SYSTEM compiler in use rather than conda's (see
-                do_conda_setup's docstring), so it is not a fully
-                from-scratch bootstrap on a bare OS image the way
-                --system ubuntu or conda-linux-full are.
+                bootstraps flex and tcsh -- see do_conda_setup's
+                docstring for why flex/csh specifically are
+                conda-provisioned rather than assumed). Still assumes
+                the system already has basic build tools (gfortran,
+                g++, make, autoconf, ghostscript) -- --system conda
+                deliberately keeps the SYSTEM compiler in use rather
+                than conda's (see do_conda_setup's docstring), so it is
+                not a fully from-scratch bootstrap on a bare OS image
+                the way --system ubuntu or conda-linux-full are.
     conda-linux-full
                 like conda, but the compiler/build-tool chain is ALSO
                 conda-provided (gfortran_linux-64, gxx_linux-64, make,
@@ -357,8 +357,26 @@ def locate_conda_base() -> Path:
 # genuinely wasn't installed system-wide, breaking --system conda's
 # "just works from a bare Miniconda install" promise for ERS_Hector_EQ
 # and any other .l/.y-derived build.
+#
+# `tcsh` (2026-09-28, real run: correct_iono=1 on real NISAR_CSAF data):
+# same reasoning as flex -- csh has no ABI/linkage implications either
+# (it's an interpreter invoked by ~90 gmtsar/csh/*.csh scripts, nothing
+# links against it), so bootstrap it here too rather than only assume/
+# document it, exactly like flex. There is no plain "csh" package on
+# conda-forge, only "tcsh" (a superset/reimplementation csh has been a
+# symlink to on most Linux distros for decades) -- do_conda_setup's
+# _ensure_csh_symlink creates that same csh->tcsh symlink inside the
+# conda env's bin/ (previously only done for --system conda-linux-full;
+# see CONDA_FORGE_FULL_ISOLATION_PACKAGES's own tcsh entry below, now
+# redundant with this one but left for that list's own documentation
+# value). On its own this only fixes PATH-resolved csh invocations
+# (`run("csh ...")`) -- _patch_csh_shebangs() is the other half, needed
+# because these scripts hardcode "#!/bin/csh" (an absolute path the
+# kernel execve()s directly, never consulting PATH) rather than
+# resolving csh via PATH the way this fix and every other tool here
+# already do.
 CONDA_FORGE_BOOTSTRAP_PACKAGES = [
-    "gmt=6.4", "gshhg-gmt", "dcw-gmt", "flex",
+    "gmt=6.4", "gshhg-gmt", "dcw-gmt", "flex", "tcsh",
     "hdf5=1.12.*", "libtiff>=4.5,<5", "liblapack>=3.9",
     # Real bug found 2026-07-23 (a genuine --system conda-linux-full clean-room
     # env creation, not a fixture): python itself is pulled in
@@ -569,7 +587,15 @@ def do_ubuntu_deps() -> None:
 # them itself the way --system ubuntu does via apt. Checked up front so a
 # missing one fails fast with a clear message, instead of surfacing as a
 # cryptic autoconf/make error deep inside the build.
-REQUIRED_SYSTEM_BUILD_TOOLS = ("gfortran", "g++", "make", "autoconf", "csh", "gs")
+#
+# "csh" removed 2026-09-28: previously hard-required here (same as
+# gfortran/g++), but it's now conda-bootstrapped (tcsh, in
+# CONDA_FORGE_BOOTSTRAP_PACKAGES) + shebang-patched (_patch_csh_shebangs)
+# instead of assumed present, matching flex's existing treatment -- see
+# do_conda_setup's docstring. Failing here on a missing system csh would
+# now be a false negative: a host with no /bin/csh at all still builds
+# fine once do_conda_setup/do_build run.
+REQUIRED_SYSTEM_BUILD_TOOLS = ("gfortran", "g++", "make", "autoconf", "gs")
 # "gs" is the actual binary name for ghostscript.
 
 def _check_system_build_tools() -> None:
@@ -579,7 +605,7 @@ def _check_system_build_tools() -> None:
             "ERROR: --system conda still requires these system build tools "
             f"on PATH (not provisioned by conda): {', '.join(missing)}. "
             "Install them via your OS package manager (e.g. on Ubuntu: "
-            "apt install gfortran g++ make autoconf csh ghostscript), then "
+            "apt install gfortran g++ make autoconf ghostscript), then "
             "re-run. See install.py's --system conda docstring for why "
             "these aren't conda-provisioned."
         )
@@ -617,6 +643,32 @@ def _check_conda_linux_full_platform() -> None:
         )
 
 
+def _ensure_csh_symlink(prefix: Path) -> None:
+    """Create prefix/bin/csh -> prefix/bin/tcsh if it doesn't already
+    exist (no plain "csh" package on conda-forge, only "tcsh" -- see
+    CONDA_FORGE_BOOTSTRAP_PACKAGES's own "tcsh" comment for the full
+    rationale). Shared by both do_conda_setup's plain path (2026-09-28:
+    tcsh is now in CONDA_FORGE_BOOTSTRAP_PACKAGES unconditionally, same
+    as flex) and _check_conda_full_isolation_tools (--system
+    conda-linux-full, where this already existed before 2026-09-28 --
+    extracted here rather than duplicated).
+
+    On its own this only fixes PATH-resolved `csh` invocations
+    (`run("csh ...")`, any subprocess using extra_env's PATH, or a
+    manually activated conda env) -- it does NOT fix a .csh script
+    invoked directly via its own hardcoded "#!/bin/csh" shebang, since
+    the kernel execve()s that literal path without ever consulting PATH.
+    See _patch_csh_shebangs() for that other half of the fix."""
+    csh_link = prefix / "bin" / "csh"
+    if csh_link.exists():
+        return
+    tcsh = prefix / "bin" / "tcsh"
+    if not tcsh.is_file():
+        sys.exit(f"ERROR: {tcsh} not found -- conda env is missing tcsh.")
+    csh_link.symlink_to(tcsh)
+    print(f"==> Created {csh_link} -> tcsh (no plain csh package on conda-forge)")
+
+
 def _check_conda_full_isolation_tools(prefix: Path) -> dict[str, str]:
     """Verify the env actually has the full-isolation compiler/build-tool
     set (whether just-created or a pre-existing env being reused), and
@@ -644,13 +696,6 @@ def _check_conda_full_isolation_tools(prefix: Path) -> dict[str, str]:
             f"`conda install -n <env> -c conda-forge "
             f"{' '.join(CONDA_FORGE_FULL_ISOLATION_PACKAGES)}`."
         )
-    csh_link = prefix / "bin" / "csh"
-    if not csh_link.exists():
-        tcsh = prefix / "bin" / "tcsh"
-        if not tcsh.is_file():
-            sys.exit(f"ERROR: {tcsh} not found -- conda env is missing tcsh.")
-        csh_link.symlink_to(tcsh)
-        print(f"==> Created {csh_link} -> tcsh (no plain csh package on conda-forge)")
     return {"CC": cc, "CXX": cxx, "F77": f77}
 
 
@@ -666,12 +711,15 @@ def do_conda_setup(conda_env: str, full_isolation: bool = False,
     full_isolation below) and so these build flags don't silently leak
     into every other subprocess this script runs. This is why plain
     --system conda still assumes the system's own compiler/build-tool
-    chain (gfortran, g++, make, autoconf, csh, ghostscript) is already
+    chain (gfortran, g++, make, autoconf, ghostscript) is already
     present, unlike --system ubuntu which provisions all of that itself
-    via apt. flex is the one exception -- bootstrapped via conda-forge
-    instead of assumed present even in plain conda mode, since (unlike a
-    compiler) it has no ABI/linkage implications for the rest of the
-    build -- see CONDA_FORGE_BOOTSTRAP_PACKAGES's comment.
+    via apt. flex and csh (via tcsh) are the two exceptions --
+    bootstrapped via conda-forge instead of assumed present even in
+    plain conda mode, since (unlike a compiler) neither has ABI/linkage
+    implications for the rest of the build -- see
+    CONDA_FORGE_BOOTSTRAP_PACKAGES's comment (csh also needs
+    _patch_csh_shebangs(), called from do_build(), since conda/PATH
+    provisioning alone can't satisfy a hardcoded "#!/bin/csh" shebang).
 
     full_isolation=True (--system conda-linux-full): confirmed working via a
     real clean-room build, 2026-07-23 (docs/PATHWAY_FORWARD.md). Uses
@@ -685,6 +733,12 @@ def do_conda_setup(conda_env: str, full_isolation: bool = False,
                 if full_isolation else CONDA_FORGE_BOOTSTRAP_PACKAGES)
     prefix = locate_conda_env(conda_env, packages=packages, known_prefix=known_prefix)
     print(f"==> Using conda env at {prefix} (no sudo)")
+    # tcsh is in CONDA_FORGE_BOOTSTRAP_PACKAGES unconditionally (both
+    # plain and full-isolation pull it in), so this symlink applies to
+    # both modes -- single call site, not duplicated inside
+    # _check_conda_full_isolation_tools (which used to create it itself
+    # before 2026-09-28).
+    _ensure_csh_symlink(prefix)
     compiler_env = _check_conda_full_isolation_tools(prefix) if full_isolation else {}
     extra_env = {
         **compiler_env,
@@ -1128,6 +1182,82 @@ C_FIXES = {
 }
 
 
+def _patch_csh_shebangs() -> None:
+    """Rewrite every gmtsar/csh/*.csh and gmtsar/python/csh_shims/*.csh
+    script's hardcoded "#!/bin/csh" shebang to the PATH-resolvable
+    "#!/usr/bin/env -S csh" (preserving any trailing flags, e.g. "-f").
+
+    Real bug found 2026-09-25/28 running correct_iono=1 on real
+    NISAR_CSAF data: `proj_ll2ra.csh` failed with `/bin/sh:
+    proj_ll2ra.csh: /bin/csh: bad interpreter: No such file or
+    directory` on a host with no /bin/csh. Earlier fixes in this
+    session (this same file's do_conda_setup, and the runbook's own
+    manual-workaround notes) install tcsh via conda and symlink it as
+    `csh` -- but ONLY on PATH (inside the conda env's bin/), which fixes
+    every PATH-resolved invocation (`run("csh some_script")`,
+    subprocess calls, etc) but does nothing for a script executed
+    directly via its own hardcoded "#!/bin/csh" shebang: the kernel
+    execve()s the literal path baked into that line, never consulting
+    PATH at all. As long as these ~90 .csh scripts hardcode "#!/bin/csh"
+    specifically, no amount of conda-provisioning or PATH manipulation
+    can make them find a conda-only csh -- /bin/csh has to be made to
+    literally exist, which needs root on most hosts, defeating the
+    entire point of --system conda's no-sudo promise.
+
+    Rewriting the shebang to search PATH (like every other tool this
+    build already depends on: gmt, gfortran, etc) is the fix that
+    actually composes with this file's own conda-bootstrapped csh
+    symlink (see CONDA_FORGE_BOOTSTRAP_PACKAGES's "tcsh" entry and
+    do_conda_setup's _ensure_csh_symlink call) -- once the user's shell
+    or this script's own extra_env has the conda env's bin/ on PATH
+    (already required for `gmt` itself to resolve, per print_summary's
+    existing "conda activate <env>" instruction), `csh` resolves too,
+    with zero extra steps.
+
+    Uses `env -S` (GNU coreutils >= 8.30) rather than plain `env csh -f`
+    because the kernel's shebang parsing passes everything after the
+    interpreter path as ONE opaque argument string (no further word
+    splitting) -- `#!/usr/bin/env csh -f` would make env look for an
+    executable literally named "csh -f". `-S` is env's own documented
+    mechanism for exactly this multi-argument-shebang case: it re-splits
+    that single string into separate words itself.
+
+    Same category of build-time in-place fix as
+    _defuse_fake_lex_sources() (a small, purely mechanical, identically-
+    applied transformation across many files) rather than C_FIXES'
+    static full-content overlay (reserved for genuinely hand-crafted
+    content changes to a couple of specific files) -- copying ~90 files'
+    full content into gmtsar/python/c_fixes/ just to change one line
+    each would be an unmaintainable amount of drift from upstream.
+    Idempotent: a second run is a no-op (the shebang no longer matches
+    "#!/bin/csh", so nothing gets rewritten again)."""
+    csh_dirs = [
+        REPO_ROOT / "gmtsar" / "csh",
+        REPO_ROOT / "gmtsar" / "python" / "csh_shims",
+    ]
+    patched = []
+    for d in csh_dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.csh")):
+            text = f.read_text()
+            newline = "\n" if "\n" in text else ""
+            first_line, _, rest = text.partition("\n")
+            if not first_line.startswith("#!/bin/csh"):
+                continue
+            trailing = first_line[len("#!/bin/csh"):]  # e.g. " -f " or ""
+            new_first_line = f"#!/usr/bin/env -S csh{trailing}"
+            if new_first_line == first_line:
+                continue
+            f.write_text(new_first_line + newline + rest)
+            patched.append(f)
+    if patched:
+        print(f"==> patched {len(patched)} .csh script shebang(s) "
+              f"(#!/bin/csh -> #!/usr/bin/env -S csh, PATH-resolvable): "
+              + ", ".join(p.name for p in patched[:5])
+              + (f", ... (+{len(patched) - 5} more)" if len(patched) > 5 else ""))
+
+
 def _apply_c_fixes() -> None:
     for src, dst in C_FIXES.items():
         if not src.is_file():
@@ -1153,6 +1283,7 @@ def do_build(use_conda: bool, conda_prefix: Path | None,
     os.chdir(REPO_ROOT)
     _apply_c_fixes()
     _defuse_fake_lex_sources()
+    _patch_csh_shebangs()
     build_env = None
     if extra_env:
         build_env = dict(os.environ)

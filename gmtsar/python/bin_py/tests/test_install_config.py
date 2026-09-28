@@ -117,6 +117,84 @@ def test_gshhg_gmt_not_gshhg_gmt_nc4():
     create` fails outright with PackagesNotFoundError on a truly fresh
     env. The correct package is gshhg-gmt."""
     assert "gshhg-gmt" in install.CONDA_FORGE_BOOTSTRAP_PACKAGES
+
+
+def test_tcsh_bootstrapped_via_conda_not_required_system_tool():
+    """Real gap found 2026-09-28 (a genuine run: correct_iono=1 on real
+    NISAR_CSAF data): ~90 gmtsar/csh/*.csh scripts hardcode "#!/bin/csh"
+    -- a host with no /bin/csh crashed with 'bad interpreter'. csh has
+    no ABI/linkage implications (same reasoning as flex), so it's now
+    bootstrapped via conda-forge's tcsh (paired with a csh->tcsh
+    symlink, see _ensure_csh_symlink) instead of hard-required on the
+    system PATH. Must NOT still be in REQUIRED_SYSTEM_BUILD_TOOLS --
+    that would make --system conda fail fast on exactly the host this
+    fix was meant to support."""
+    assert "tcsh" in install.CONDA_FORGE_BOOTSTRAP_PACKAGES
+    assert "csh" not in install.REQUIRED_SYSTEM_BUILD_TOOLS
+
+
+def test_ensure_csh_symlink_called_from_do_conda_setup():
+    """_ensure_csh_symlink must run for BOTH plain --system conda and
+    --system conda-linux-full -- previously only the full-isolation path
+    created this symlink (inside _check_conda_full_isolation_tools,
+    itself only called when full_isolation=True), so plain --system
+    conda never got a working `csh` at all even after tcsh landed in
+    CONDA_FORGE_BOOTSTRAP_PACKAGES for both modes."""
+    import inspect
+    src = inspect.getsource(install.do_conda_setup)
+    assert "_ensure_csh_symlink(prefix)" in src
+
+
+def test_patch_csh_shebangs_called_from_do_build():
+    """_patch_csh_shebangs() (the other half of the csh fix -- conda/PATH
+    provisioning alone can't satisfy a script's own hardcoded
+    "#!/bin/csh" shebang, since the kernel execve()s that literal path
+    without consulting PATH) must actually run during a build, not just
+    exist unused."""
+    import inspect
+    src = inspect.getsource(install.do_build)
+    assert "_patch_csh_shebangs()" in src
+
+
+def test_patch_csh_shebangs_rewrites_real_repo_scripts(tmp_path):
+    """End-to-end check of _patch_csh_shebangs() against scratch copies
+    of the REAL shape of files it will actually see (hardcoded
+    "#!/bin/csh [-f]", plus a non-csh script and an already-patched one
+    that must be left alone) -- run against a temporary REPO_ROOT so it
+    never touches the real checkout."""
+    csh_dir = tmp_path / "gmtsar" / "csh"
+    csh_dir.mkdir(parents=True)
+    shims_dir = tmp_path / "gmtsar" / "python" / "csh_shims"
+    shims_dir.mkdir(parents=True)
+
+    (csh_dir / "proj_ll2ra.csh").write_text("#!/bin/csh -f \nsome content\n")
+    (csh_dir / "noflags.csh").write_text("#!/bin/csh\necho hi\n")
+    (csh_dir / "already_fixed.csh").write_text(
+        "#!/usr/bin/env -S csh -f\necho already\n")
+    (csh_dir / "not_csh.csh").write_text("#!/bin/sh\necho notcsh\n")
+    (shims_dir / "p2p_ALOS.csh").write_text("#!/bin/csh -f\nshim content\n")
+
+    old_root = install.REPO_ROOT
+    install.REPO_ROOT = tmp_path
+    try:
+        install._patch_csh_shebangs()
+        # Idempotent: a second run must not error or double-rewrite.
+        install._patch_csh_shebangs()
+    finally:
+        install.REPO_ROOT = old_root
+
+    assert (csh_dir / "proj_ll2ra.csh").read_text().startswith(
+        "#!/usr/bin/env -S csh -f")
+    assert (csh_dir / "noflags.csh").read_text().startswith(
+        "#!/usr/bin/env -S csh\n")
+    assert (csh_dir / "already_fixed.csh").read_text().startswith(
+        "#!/usr/bin/env -S csh -f\n")
+    assert (csh_dir / "not_csh.csh").read_text().startswith("#!/bin/sh")
+    assert (shims_dir / "p2p_ALOS.csh").read_text().startswith(
+        "#!/usr/bin/env -S csh -f\n")
+    # Content after the shebang line must be untouched.
+    assert "some content" in (csh_dir / "proj_ll2ra.csh").read_text()
+    assert "shim content" in (shims_dir / "p2p_ALOS.csh").read_text()
     assert "gshhg-gmt-nc4" not in install.CONDA_FORGE_BOOTSTRAP_PACKAGES
 
 

@@ -259,6 +259,23 @@ def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
         run(f"ln -sf {slc_dir}/{rep}.SLC .")
         run(f"cp {slc_dir}/{ref}.PRM .")
         run(f"cp {slc_dir}/{rep}.PRM .")
+        if side == "intf_h" and iono_skip_est == 0:
+            # Real bug found 2026-09-25 on real NISAR_CSAF data:
+            # estimate_ionospheric_phase reads center_freq/high_freq/
+            # low_freq from "{intf_h}/params1" (see its own source) --
+            # matching the csh reference (p2p_processing_nsr.csh), which
+            # does `cp ../../SLC/params* .` into intf_h/intf_l right after
+            # linking the PRM/LED, before ever calling intf. This fork's
+            # _iono_split_scene writes that same split_spectrum output as
+            # SLC/params_<stem> (keyed by scene, shared across every pair
+            # referencing it) rather than the csh's per-pair params1/
+            # params2 -- but nothing ever copied it into intf_h, so
+            # estimate_ionospheric_phase crashed with a bare
+            # FileNotFoundError on ../intf_h/params1. estimate_ionospheric_
+            # phase only ever reads params1 (never params2), so only the
+            # ref scene's params file needs to land here, under that name.
+            params_src = os.path.join(case_root, "SLC", f"params_{ref}")
+            run(f"cp {params_src} params1")
         if topo_phase == 1:
             topo_file = "topo_shift.grd" if shift_topo == 1 else "topo_ra.grd"
             run(f"ln -sf {topo_dir}/{topo_file} .")
