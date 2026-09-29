@@ -1,5 +1,52 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-29 (4): `landmask` crashed with a bare internal `RuntimeError` when `landmask_ra.grd` covers less than `region_cut`
+
+After the stale-file self-heal fix above correctly detected and rebuilt
+the wrong-shaped `landmask_ra.grd`, `landmask` itself then crashed on
+the very next run, in a genuinely new spot:
+
+```
+RuntimeError: internal: BCR query index left the padded grid -- output
+region outside input by more than the PAD of 2 cells. gmt_grdsample.c's
+wesn_o adjustment should prevent this; check new_region vs input extent.
+```
+
+Root cause: `proj_ll2ra.csh` (called inside `utils/landmask`) projects
+the lon/lat landmask into radar coordinates via `trans.dat`, and its
+output can legitimately cover LESS than the full nominal `region_cut`
+-- some edge/corner radar pixels simply don't geocode within the DEM's
+lon/lat extent. This is expected, upstream behavior: `landmask.csh`
+(and this port) explicitly handle the shortfall a few lines later
+("if the landmask region is smaller than the region_cut pad with NaN",
+via `gmt xyz2grd ... -R<region_cut>`), and the ORIGINAL csh's own
+`gmt grdsample landmask_ra.grd -Gtmp.grd -R$1 -I4/8 -nl+t0.1` call --
+requesting the FULL region_cut even though the input may fall short --
+is exactly this same routine, expected shortfall-handling design, not
+a mistake.
+
+The gap is in this fork's in-process `gmt_grdsample_py.py` port: real
+`gmt grdsample` tolerates an output region that overshoots the input's
+actual coverage (edge-extends within its own padding), but the
+in-process port has a hard `PAD=2`-cell limit and raises a bare
+`RuntimeError` the moment a real scene's shortfall exceeds that --
+which real NISAR_CSAF data does. Rather than guess at replicating
+gmt's own internal edge-extension semantics inside the shared numba
+port (used by many other call sites across the codebase, so a wrong
+guess there risks silently changing behavior elsewhere), fixed at the
+call site instead: `utils/landmask` now catches that specific
+`RuntimeError` and falls back to the real `gmt grdsample` subprocess
+for this one call -- the same code path `GMTSAR_GRDSAMPLE_PY=0` already
+exercises and that's known to match the original csh, just triggered
+automatically instead of requiring the user to notice and set an env
+var by hand.
+
+Verified with three new tests in
+`test_landmask_grdsample_fallback.py` (new file): the happy path skips
+the subprocess fallback, the actual PAD-overshoot RuntimeError trips
+the fallback with the correct `-R<region_cut>` command, and the
+pre-existing `GMTSAR_GRDSAMPLE_PY=0` path is unchanged. All 3 pass.
+
 ## Fixed 2026-09-29 (3): `grdmath2 MUL: shape mismatch` on `landmask_ra_patch.grd` kept recurring after the "-999" sentinel fix
 
 After the `region_cut = "-999"` sentinel fix (see below), the user hit

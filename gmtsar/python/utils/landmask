@@ -57,14 +57,41 @@ def landmask():
     print('LANDMASK: require full resolution coastline from GMT ... ...')
     run("gmt grdlandmask -Glandmask.grd `gmt grdinfo -I- dem.grd` `gmt grdinfo -I dem.grd` "+str(V)+" -NNaN/1 -Df")
     run("proj_ll2ra.csh trans.dat landmask.grd landmask_ra.grd")
+    # Real bug found 2026-09-29 on real NISAR_CSAF data: proj_ll2ra.csh's
+    # radar-coordinate landmask_ra.grd can legitimately cover LESS than
+    # the full nominal region_cut (edge/corner radar pixels that don't
+    # geocode within the DEM's lon/lat extent) -- this is expected and
+    # already handled a few lines below ("if the landmask region is
+    # smaller than the region_cut pad with NaN" via `xyz2grd -R<region_cut>`,
+    # verbatim from the original csh). The real `gmt grdsample` binary
+    # tolerates resampling to a -R that overshoots the input's actual
+    # coverage (it's edge-padded internally); our in-process port
+    # (gmt_grdsample_py) has a hard PAD=2-cell limit and raises a bare
+    # RuntimeError ("BCR query index left the padded grid") the moment a
+    # real scene's shortfall exceeds that -- exactly what happened here.
+    # Rather than guess at replicating gmt's own internal edge-extension
+    # semantics in the shared numba port (used by many other callers),
+    # fall back to the real `gmt grdsample` subprocess for this specific
+    # call when the in-process port can't handle the overshoot -- it's
+    # the same code path GMTSAR_GRDSAMPLE_PY=0 already exercises, just
+    # triggered automatically instead of requiring the user to notice
+    # and set an env var.
+    _resampled = False
     if _grdsample_py_on():
         _r = [float(v) for v in sys.argv[1].split("/")]
-        _grdsample_inproc("landmask_ra.grd", "tmp.grd",
-                          region=(_r[0], _r[1], _r[2], _r[3]),
-                          x_inc=4.0, y_inc=8.0,
-                          interp="bilinear",
-                          threshold=0.1)
-    else:
+        try:
+            _grdsample_inproc("landmask_ra.grd", "tmp.grd",
+                              region=(_r[0], _r[1], _r[2], _r[3]),
+                              x_inc=4.0, y_inc=8.0,
+                              interp="bilinear",
+                              threshold=0.1)
+            _resampled = True
+        except RuntimeError as exc:
+            print(f"LANDMASK: WARN: in-process grdsample failed ({exc!r}); "
+                  "falling back to gmt grdsample subprocess (real gmt "
+                  "tolerates landmask_ra.grd covering less than region_cut "
+                  "-- the in-process port's PAD=2 limit does not).")
+    if not _resampled:
         run("gmt grdsample landmask_ra.grd -Gtmp.grd -R"+sys.argv[1]+" -I4/8 -nl+t0.1")
     file_shuttle('tmp.grd','landmask_ra.grd','mv')
     
