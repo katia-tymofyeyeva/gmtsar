@@ -1,5 +1,113 @@
 # Pathway forward — what's ported, what's not, and why
 
+## OPEN QUESTION 2026-09-29: split_spectrum-based ionospheric correction cannot work on NISAR data as ingested today
+
+Running `correct_iono=1` end-to-end on real NISAR_CSAF data surfaced a
+real, upstream design gap (not a bug introduced by this fork's port):
+
+`split_spectrum.c` computes the high/low sub-band frequencies as
+`fh = cf + bc`, `fl = cf - bc`, where `bc = |pulsedur * chirp_slope| / 3`
+(with a hardcoded-bandwidth special case for `SC_identity == 10`). For
+NISAR PRMs, `make_slc_nsr_py.py`'s `pop_prm_hdf5()` hardcodes
+`prm.pulsedur = 0.0` and `prm.chirp_slope = 0.0` unconditionally --
+faithfully replicating the *original upstream C* `make_slc_nsr.c`, which
+reads `nominalAcquisitionPRF`/`processedRangeBandwidth` from the HDF5
+into scratch variables and then immediately discards them, with an
+inline C comment: "this is wrong but not needed for SLC." That audited
+byte-for-byte match was verified correct for the SLC-ingestion use case
+this fork's port was built and tested against -- but it means `bc == 0`
+for every NISAR pair, so `fh == fl == fc` always, and
+`estimate_ionospheric_phase`'s `limit = fh*fl / (fh**2 - fl**2) * pi`
+always divides by zero.
+
+Two fail-loud guards were added today so this surfaces clearly instead
+of cascading into a chain of increasingly confusing downstream errors
+(see the "Fixed 2026-09-29" entry below): `estimate_ionospheric_phase`
+now exits with a clear message instead of raising `ZeroDivisionError`,
+and `intf_batch`'s `_iono_one_pair` now checks that
+`ph_iono_orig.grd` actually exists before touching `phasefilt.grd`, so a
+failed iono estimate no longer destroys the perfectly good
+non-corrected filtered phase.
+
+But the underlying gap is still open: **`correct_iono=1` cannot produce
+a real ionospheric correction on NISAR data until something supplies a
+real, nonzero range bandwidth to `split_spectrum`.** The real value
+(`processedRangeBandwidth`) IS present in the NISAR HDF5 product and is
+read (then discarded) by `pop_prm_hdf5()` today. Two plausible paths,
+neither implemented:
+1. Add a `SC_identity == 14` branch in `split_spectrum.c` analogous to
+   the existing `SC_identity == 10` hardcoded-bandwidth special case --
+   but that needs a real bandwidth value baked in or threaded through
+   somehow, since `split_spectrum` never reads the HDF5 itself, only the
+   PRM.
+2. Actually populate `prm.pulsedur`/`prm.chirp_slope` (or add a new PRM
+   field carrying the real bandwidth directly) in
+   `make_slc_nsr_py.py`/`make_slc_nsr.c` from `processedRangeBandwidth`,
+   deviating from the currently-audited "discard it" behavior for this
+   one field -- SLC production itself doesn't need it (confirmed by the
+   existing audit), so this would be additive, not a regression risk to
+   basic processing.
+Not touched pending the user's decision on which path (and whether to
+patch the upstream `.c` file or the Python port, or both) -- this is a
+real feature gap requiring a design choice, not a one-line fix.
+
+## Fixed 2026-09-29: two more real bugs on real NISAR_CSAF data --
+`region_cut`'s own "-999" sentinel leaking into `landmask`/`snaphu`, and
+a failed ionospheric estimate silently destroying `phasefilt.grd`
+
+Running a full `correct_iono=1` pair end-to-end (with `mask_water`/
+`switch_land` enabled) surfaced two more real, distinct bugs:
+
+**Bug 1: `landmask -999` crashed with a bare `IndexError`.** The
+codebase already has an established convention (see the September
+NSR pre-proc entries below) that `region_cut`'s "full scene" sentinel is
+the literal string `"-999"`, not just `""` -- `pre_proc_nsr`/
+`pop_config.csh` and friends all check `region_cut in (None, "", "-999")`.
+But `intf_batch`'s `_intf_one_pair` only recomputed the real
+`gmt grdinfo phase.grd -I-`-derived region when `region_cut` was falsy
+(`if not region_cut:`), so a config with `region_cut = -999` sailed
+straight through, unrecomputed, into `landmask {region_cut}` and
+`snaphu {threshold_snaphu} {defomax} {interp_flag} {region_cut}`.
+`utils/landmask`'s `sys.argv[1].split("/")` on the literal string
+`"-999"` produces a single-element list, and the very next line indexes
+`_r[1]`/`_r[2]`/`_r[3]` -- a bare `IndexError`. Worse: because most of
+`landmask` (the `grdlandmask` + `proj_ll2ra.csh` calls) ran fine before
+that crash, it left behind a full-resolution, never-decimated
+`landmask_ra.grd` in `topo/`, which then caused a *second*, more
+confusing failure downstream: `grdmath2 MUL: shape mismatch
+phase_patch.grd(13680, 13329) vs landmask_ra_patch.grd(23728, 15192)` in
+`snaphu.py`, since the real (skipped) resample step would have brought
+`landmask_ra.grd` down to match the decimated phase grid's `-I4/8`
+resolution. Fixed by matching the existing `"-999"`-sentinel convention:
+`_intf_one_pair` now recomputes the real region whenever `region_cut` is
+falsy OR the literal string `"-999"`.
+
+**Bug 2: a failed `estimate_ionospheric_phase` call silently deleted the
+only good `phasefilt.grd`.** `gmtsar_lib.run()` never raises on a
+nonzero exit code (see its own docstring) -- so when
+`estimate_ionospheric_phase` failed (root-caused above: the NISAR
+zero-bandwidth `ZeroDivisionError`), `_iono_one_pair` still
+unconditionally ran `mv phasefilt.grd phasefilt_non_corrected.grd`
+followed by a `grdsample`/`grdmath` chain reading a `ph_iono_orig.grd`
+that was never created -- destroying the one good, non-corrected
+filtered phase and leaving `phasefilt.grd` missing entirely. That's what
+caused the *third* failure several minutes later, deep in `geocode`: a
+`netCDF4`/`xarray` `FileNotFoundError` on `phasefilt.grd` "was not
+found," which by that point looked completely unrelated to the original
+iono failure. Fixed by checking `check_file_report` on the real
+`ph_iono_orig.grd` output before doing any of the mv/grdsample/grdmath;
+if it's missing, `phasefilt.grd` is now left alone as the non-corrected
+filtered phase instead of being destroyed.
+
+Verified via `bin_py/tests/test_intf_batch_iono.py`'s new
+`test_region_cut_999_sentinel_recomputed_not_passed_through` (asserts no
+`run()` call ends in a literal `-999`, and that `landmask`/`snaphu` both
+receive the grdinfo-derived region instead) and by updating
+`test_correct_iono_1_skip_est_0_runs_full_correction`'s mock to create
+`ph_iono_orig.grd` on a successful `estimate_ionospheric_phase` call
+(matching that script's own documented output contract) so the full
+correction path is still exercised. All 13 tests in that file pass.
+
 ## Built 2026-09-28: `install.py` now auto-provisions `csh` for `--system conda` -- no more manual tcsh symlink
 
 The user asked whether the recurring "install tcsh via conda + symlink

@@ -63,6 +63,18 @@ class TestIntfBatchIono(unittest.TestCase):
 
         def fake_run(cmd):
             self.calls.append(("run", cmd))
+            if cmd.startswith("estimate_ionospheric_phase"):
+                # Real script writes ph_iono_orig.grd into cwd on success
+                # (see estimate_ionospheric_phase's own module docstring:
+                # "Output: ph_iono.grd, ph_iono_orig.grd, ph_corrected.grd
+                # in cwd."). _iono_one_pair now checks for this file before
+                # doing the mv/grdsample/grdmath (real bug found
+                # 2026-09-29: it used to plow ahead even when
+                # estimate_ionospheric_phase failed, since run() never
+                # raises on nonzero exit -- see intf_batch's own comment).
+                # Simulate a successful run here so the "happy path" tests
+                # below still exercise the full correction.
+                open("ph_iono_orig.grd", "w").close()
             class R:
                 returncode = 0
             return R()
@@ -171,6 +183,63 @@ mask_water = 0
             return list(self.calls)
         finally:
             shutil.rmtree(tmpdir)
+
+    def test_region_cut_999_sentinel_recomputed_not_passed_through(self):
+        """Real bug found 2026-09-28/29 on real NISAR_CSAF data:
+        region_cut's own established "full scene" sentinel is the literal
+        string "-999" (matching pre_proc_nsr/pop_config's region_cut
+        convention -- see PATHWAY_FORWARD.md), not just "". _intf_one_pair
+        used to only recompute the real grdinfo-derived region when
+        region_cut was falsy, so a config with `region_cut = -999` passed
+        that literal string straight through to `landmask`/`snaphu`.
+        landmask's argv[1].split("/") on "-999" then crashed with a bare
+        IndexError (only one token, no slashes) after mask_water=1/
+        switch_land=1 flowed through this path -- reproduced here by
+        asserting the literal "-999" never reaches those commands, and
+        that the grdinfo-derived region (from the mocked subprocess.run,
+        "-100/100/-50/50") is used instead."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            intf_in = self._build_case(tmpdir)
+            config_path = os.path.join(tmpdir, "config.txt")
+            with open(config_path, "w") as f:
+                f.write("""\
+proc_stage = 1
+master_image = MASTER
+filter_wavelength = 200
+dec_factor = 2
+topo_phase = 1
+shift_topo = 0
+threshold_snaphu = 0.1
+threshold_geocode = 0
+region_cut = -999
+switch_land = 1
+defomax = 0
+near_interp = 0
+mask_water = 0
+""")
+            cwd0 = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                sys.argv = ["intf_batch", "NSR_A", intf_in, config_path]
+                self.calls.clear()
+                intf_batch.intf_batch()
+            finally:
+                os.chdir(cwd0)
+            calls = list(self.calls)
+        finally:
+            shutil.rmtree(tmpdir)
+
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        literal_999_leaks = [c for c in run_cmds if c.strip().endswith("-999")]
+        self.assertEqual(literal_999_leaks, [], f"sentinel leaked through: {literal_999_leaks}")
+        landmask_calls = [c for c in run_cmds if c.startswith("landmask ")]
+        self.assertTrue(landmask_calls, "expected at least one landmask call")
+        for c in landmask_calls:
+            self.assertIn("-100/100/-50/50", c, c)
+        snaphu_calls = [c for c in run_cmds if c.startswith("snaphu ")]
+        for c in snaphu_calls:
+            self.assertIn("-100/100/-50/50", c, c)
 
     def test_correct_iono_unset_adds_zero_new_calls(self):
         """The regression-safety guarantee: correct_iono defaulting to 0/

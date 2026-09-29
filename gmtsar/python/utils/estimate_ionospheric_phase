@@ -130,6 +130,36 @@ def estimate_ionospheric_phase():
     fl = grep_value(f"{intf_h}/params1", "low_freq",    3)
     thresh = 0.1
 
+    # Fail-loud check added 2026-09-29 after a real ZeroDivisionError on
+    # NISAR_CSAF data: split_spectrum.c computes fh = cf + bc, fl = cf - bc
+    # where bc = |pulsedur * chirp_slope| / 3. For NISAR-ingested PRMs,
+    # make_slc_nsr_py.py (matching the upstream C's own documented, audited
+    # behavior) hardcodes pulsedur/chirp_slope to 0.0 -- an inline comment
+    # in the original C says "this is wrong but not needed for SLC". That
+    # makes bc == 0 for every NISAR pair, so fh == fl == fc always, and the
+    # `limit` formula below (which divides by fh**2 - fl**2) always raised
+    # a bare ZeroDivisionError. This is NOT a bug in this script -- it's a
+    # real upstream gap: split_spectrum-based ionospheric correction needs
+    # a real, nonzero range bandwidth, and NISAR PRMs never carry one via
+    # the normal chirp_slope/pulsedur fields. See PATHWAY_FORWARD.md for
+    # the open question of how to source a real bandwidth for NISAR (e.g.
+    # a SC_identity==14 branch in split_spectrum.c analogous to the
+    # existing SC_identity==10 hardcoded-bandwidth special case, fed by
+    # processedRangeBandwidth from the HDF5 -- currently read-and-discarded
+    # by make_slc_nsr_py.py). Failing loud here instead of raising inside
+    # the `limit` arithmetic points straight at the real cause.
+    if float(fh) == float(fl):
+        sys.exit(
+            f"estimate_ionospheric_phase: high_freq == low_freq == "
+            f"{fh!r} in {intf_h}/params1 -- split_spectrum produced a zero "
+            f"range bandwidth (fh - fl == 0), so no ionospheric estimate "
+            f"is possible. For NISAR PRMs this is expected: "
+            f"pulsedur/chirp_slope are hardcoded to 0.0 upstream (see this "
+            f"script's own comment above and PATHWAY_FORWARD.md). "
+            f"correct_iono=1 cannot currently work on NISAR data until a "
+            f"real range bandwidth is sourced for split_spectrum."
+        )
+
     print(f"Applying split spectrum result to estimate ionospheric phase ({fh} {fl})...")
     run(f"cp {intf}/phasefilt.grd ./ph0.grd")
 

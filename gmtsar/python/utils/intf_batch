@@ -297,12 +297,33 @@ def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
         os.chdir(os.path.join(iono_dir, "iono_correction"))
         run(f"estimate_ionospheric_phase ../intf_h ../intf_l ../intf_o "
             f"{intf_sub} {iono_filt_rng} {iono_filt_azi}")
-        os.chdir(intf_sub)
-        file_shuttle("phasefilt.grd", "phasefilt_non_corrected.grd", "mv")
-        run(f"gmt grdsample {iono_dir}/iono_correction/ph_iono_orig.grd "
-            "-Rphasefilt_non_corrected.grd -Gph_iono.grd")
-        run("gmt grdmath phasefilt_non_corrected.grd ph_iono.grd SUB PI ADD "
-            "2 PI MUL MOD PI SUB = phasefilt.grd")
+        # Real bug found 2026-09-29 on real NISAR_CSAF data: run() never
+        # raises on a nonzero exit code (see gmtsar_lib.run's own
+        # docstring), so when estimate_ionospheric_phase fails (e.g. the
+        # ZeroDivisionError from fh==fl==fc on NISAR PRMs -- see that
+        # script's own comment and PATHWAY_FORWARD.md) this code used to
+        # plow ahead: mv phasefilt.grd away, then feed a nonexistent
+        # ph_iono_orig.grd into grdsample/grdmath, deleting the only usable
+        # phasefilt.grd and leaving a broken one behind -- which is exactly
+        # what caused the later `xarray`/`netCDF4` FileNotFoundError in
+        # geocode ("phasefilt.grd was not found"). Now check for the real
+        # output before doing any of that, and leave phasefilt.grd alone
+        # (the non-corrected filtered phase) if the estimate didn't
+        # actually produce one, rather than destroying a good file to
+        # chase a failed correction.
+        ph_iono_orig = os.path.join(iono_dir, "iono_correction", "ph_iono_orig.grd")
+        if check_file_report(ph_iono_orig):
+            os.chdir(intf_sub)
+            file_shuttle("phasefilt.grd", "phasefilt_non_corrected.grd", "mv")
+            run(f"gmt grdsample {ph_iono_orig} "
+                "-Rphasefilt_non_corrected.grd -Gph_iono.grd")
+            run("gmt grdmath phasefilt_non_corrected.grd ph_iono.grd SUB PI ADD "
+                "2 PI MUL MOD PI SUB = phasefilt.grd")
+        else:
+            os.chdir(intf_sub)
+            print(f"IONO: estimate_ionospheric_phase did not produce "
+                  f"{ph_iono_orig} -- leaving phasefilt.grd as the "
+                  f"non-corrected filtered phase for pair {sub}.")
     os.chdir(intf_sub)
     print(f"IONO PHASE ESTIMATE - END (pair {sub})")
 
@@ -336,7 +357,20 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
     run(f"filter {ref}.PRM {rep}.PRM {filter_wavelen} {dec}")
     print("INTF + FILTER - END")
 
-    if not region_cut:
+    # Real bug found 2026-09-28 on real NISAR_CSAF data: region_cut's own
+    # established "full scene" sentinel is the literal string "-999" (see
+    # pop_config.csh / pre_proc_nsr's region_cut convention, documented in
+    # PATHWAY_FORWARD.md), NOT just "" -- but this function only recomputed
+    # the real grdinfo-derived region when region_cut was falsy, so a config
+    # with `region_cut = -999` passed that literal string straight through
+    # to `landmask`/`snaphu`. landmask's argv[1].split("/") on "-999" then
+    # crashed with a bare IndexError (only one token, no slashes), and after
+    # that was fixed downstream the un-resampled full-resolution
+    # landmask_ra.grd caused a grdmath2 shape-mismatch against the decimated
+    # phase grid. Matching the "-999" convention used elsewhere in the
+    # codebase (region_cut in (None, "", "-999")) so it's treated the same
+    # as "not set" here too.
+    if not region_cut or region_cut == "-999":
         region_cut = subprocess.run(
             "gmt grdinfo phase.grd -I- | cut -c3-20",
             shell=True, stdout=subprocess.PIPE,
