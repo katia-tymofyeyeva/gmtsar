@@ -87,10 +87,14 @@ def landmask():
                               threshold=0.1)
             _resampled = True
         except RuntimeError as exc:
-            print(f"LANDMASK: WARN: in-process grdsample failed ({exc!r}); "
-                  "falling back to gmt grdsample subprocess (real gmt "
-                  "tolerates landmask_ra.grd covering less than region_cut "
-                  "-- the in-process port's PAD=2 limit does not).")
+            # NOTE: this is expected, routine behavior on real data --
+            # not a fault -- see the comment above. Logged at info level
+            # (not WARN) so it doesn't read as something gone wrong when
+            # the fallback is working exactly as designed.
+            print(f"LANDMASK: landmask_ra.grd covers less than region_cut "
+                  f"({exc}); using gmt grdsample subprocess instead of the "
+                  "in-process port for this resample (expected on real "
+                  "scenes with edge pixels outside the DEM's coverage).")
     if not _resampled:
         run("gmt grdsample landmask_ra.grd -Gtmp.grd -R"+sys.argv[1]+" -I4/8 -nl+t0.1")
     file_shuttle('tmp.grd','landmask_ra.grd','mv')
