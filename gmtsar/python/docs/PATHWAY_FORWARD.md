@@ -1,5 +1,46 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-29 (3): `grdmath2 MUL: shape mismatch` on `landmask_ra_patch.grd` kept recurring after the "-999" sentinel fix
+
+After the `region_cut = "-999"` sentinel fix (see below), the user hit
+the exact same `grdmath2 MUL: shape mismatch phase_patch.grd(13680,
+13329) vs landmask_ra_patch.grd(23728, 15192)` error again, on a later
+run. The dimensions were IDENTICAL to the original crash's leftover
+file -- the giveaway.
+
+Root cause: the "-999" fix only stops a NEW `landmask_ra.grd` from
+being built wrong. It does nothing to invalidate one that's already
+sitting on disk from an earlier crashed run. `landmask` crashes AFTER
+`proj_ll2ra.csh` writes a real (but full-resolution, never-downsampled)
+`landmask_ra.grd`, and BEFORE the resample step that would shrink it to
+match the decimated phase grid. Both `intf_batch` landmask-existence
+checks (`if not check_file_report("landmask_ra.grd")`) and
+`snaphu.py`'s own check only ever tested bare existence with
+`os.path.isfile` -- once that wrong-shaped file existed, it was trusted
+forever, on every subsequent run, with no way to self-heal short of a
+human manually deleting it.
+
+Fixed by adding `_landmask_ra_valid_for_region()` to `intf_batch`:
+before trusting an existing `landmask_ra.grd`, it reads the file's own
+`-R` region via `gmt grdinfo -C` and compares it against the freshly-
+computed `region_cut` (which `landmask` itself applies verbatim via
+`-R{region_cut}` in both its internal `xyz2grd` and `grdsample` steps,
+so a correctly-built file's region must match exactly, within a
+couple-pixel tolerance for node-registration snapping). A mismatch (or
+an unparseable/short `grdinfo -C` response) is treated as invalid, same
+as missing, so `landmask` reruns and overwrites the stale file
+automatically -- no manual `rm` needed, and this also self-heals from
+any *future* landmask crash, not just this one. Wired into both
+landmask-existence-check call sites in `intf_batch` (the iono `intf_h`
+side and the main snaphu path).
+
+Verified with two new tests in `test_intf_batch_iono.py`:
+`test_landmask_ra_valid_for_region_true_positive_and_negative` (direct
+unit test of the validator against matching/mismatched/unparseable
+`grdinfo -C` output) and `test_stale_wrong_shaped_landmask_ra_is_rebuilt`
+(a pre-existing `landmask_ra.grd` on disk is NOT silently trusted --
+`landmask` still reruns). All 16 tests in the file pass.
+
 ## Fixed 2026-09-29 (2): `reuse_topo=1` still remade `trans.dat` on every run
 
 After the two fixes below, the user reported that `reuse_topo=1` was

@@ -31,6 +31,49 @@ def _get_config(path, key, default=""):
     return default
 
 
+def _landmask_ra_valid_for_region(path, region_cut):
+    """Real bug found 2026-09-29 on real NISAR_CSAF data: both landmask_ra.grd
+    existence checks below (`if not check_file_report(...)`) only ever
+    tested bare existence, never validity. A landmask_ra.grd left behind
+    by an EARLIER crashed `landmask` run (e.g. the pre-fix "-999"
+    sentinel bug: landmask crashed with IndexError partway through, AFTER
+    `proj_ll2ra.csh` wrote a real but never-downsampled, full-resolution
+    landmask_ra.grd, but BEFORE the grdsample step that would have
+    resampled it down to region_cut) was then treated as "already built"
+    forever after, on every subsequent run -- since nothing ever
+    rechecked it once the file existed. That stale, wrong-shaped file is
+    exactly what caused the `grdmath2 MUL: shape mismatch` in snaphu.py
+    to keep recurring even after the "-999" sentinel itself was fixed:
+    the sentinel fix only stopped a NEW landmask_ra.grd from being built
+    wrong, it did nothing to invalidate one already sitting on disk.
+
+    landmask's own `-R{region_cut}` is applied verbatim in both the
+    xyz2grd and grdsample steps inside utils/landmask, so a correctly-
+    built landmask_ra.grd's own region must equal region_cut exactly.
+    Comparing the two here lets a stale/mismatched file be detected and
+    rebuilt automatically, instead of silently poisoning every run after
+    a crash until a human manually deletes it.
+    """
+    try:
+        want = [float(v) for v in str(region_cut).split("/")]
+    except ValueError:
+        return False
+    if len(want) != 4:
+        return False
+    out = subprocess.run(
+        f"gmt grdinfo -C {path}", shell=True, stdout=subprocess.PIPE,
+    ).stdout.decode("utf-8", "replace").split()
+    if len(out) < 5:
+        return False
+    try:
+        got = [float(out[1]), float(out[2]), float(out[3]), float(out[4])]
+    except ValueError:
+        return False
+    # A couple of pixels' tolerance for node-registration edge snapping;
+    # anything bigger means a genuinely different region (stale/wrong).
+    return all(abs(g - w) <= 2.0 for g, w in zip(got, want))
+
+
 def _topo_stage(master, SAT, topo_phase, shift_topo, reuse_topo=0):
     """Stage 1: make topo_ra (+ optional topo_shift).
 
@@ -300,7 +343,9 @@ def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
         file_shuttle("phase.grd", "phasefilt.grd", "cp")
         if iono_skip_est == 0:
             if mask_water == 1 or switch_land == 1:
-                if not check_file_report(os.path.join(topo_dir, "landmask_ra.grd")):
+                landmask_ra_path = os.path.join(topo_dir, "landmask_ra.grd")
+                if not (check_file_report(landmask_ra_path)
+                        and _landmask_ra_valid_for_region(landmask_ra_path, region_cut)):
                     os.chdir(topo_dir)
                     run(f"landmask {region_cut}")
                     os.chdir(os.path.join(iono_dir, side))
@@ -402,7 +447,8 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
     if threshold_snaphu != 0:
         if mask_water == 1 or switch_land == 1:
             os.chdir("../../topo")
-            if not check_file_report("landmask_ra.grd"):
+            if not (check_file_report("landmask_ra.grd")
+                    and _landmask_ra_valid_for_region("landmask_ra.grd", region_cut)):
                 run(f"landmask {region_cut}")
             os.chdir(f"../intf/{sub}")
             run("ln -sf ../../topo/landmask_ra.grd .")

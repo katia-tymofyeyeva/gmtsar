@@ -241,6 +241,101 @@ mask_water = 0
         for c in snaphu_calls:
             self.assertIn("-100/100/-50/50", c, c)
 
+    def test_landmask_ra_valid_for_region_true_positive_and_negative(self):
+        """Real bug found 2026-09-29 on real NISAR_CSAF data: even after
+        the "-999" sentinel fix, the shape-mismatch grdmath2 MUL error in
+        snaphu.py kept recurring, because landmask_ra.grd's existence
+        check never validated the file -- a landmask_ra.grd left behind
+        by an earlier CRASHED landmask run (full-resolution, never
+        downsampled) was treated as valid forever after. This is a
+        focused unit test of the new validator itself:
+        _landmask_ra_valid_for_region compares the existing file's own
+        -R region (via `gmt grdinfo -C`) against the freshly-computed
+        region_cut, and only trusts the file if they actually match."""
+        orig_run = subprocess.run
+
+        def fake_grdinfo_matching(*a, **kw):
+            class R:
+                stdout = b"landmask_ra.grd 0 53316 0 54720 -1 1 4 8 13330 6841\n"
+            return R()
+
+        def fake_grdinfo_mismatched(*a, **kw):
+            class R:
+                stdout = b"landmask_ra.grd 0 106632 0 109440 -1 1 4 8 26660 13681\n"
+            return R()
+
+        def fake_grdinfo_unparseable(*a, **kw):
+            class R:
+                stdout = b"grdinfo [ERROR]: file not found\n"
+            return R()
+
+        try:
+            subprocess.run = fake_grdinfo_matching
+            self.assertTrue(
+                intf_batch._landmask_ra_valid_for_region(
+                    "landmask_ra.grd", "0/53316/0/54720"))
+
+            subprocess.run = fake_grdinfo_mismatched
+            self.assertFalse(
+                intf_batch._landmask_ra_valid_for_region(
+                    "landmask_ra.grd", "0/53316/0/54720"))
+
+            subprocess.run = fake_grdinfo_unparseable
+            self.assertFalse(
+                intf_batch._landmask_ra_valid_for_region(
+                    "landmask_ra.grd", "0/53316/0/54720"))
+        finally:
+            subprocess.run = orig_run
+
+    def test_stale_wrong_shaped_landmask_ra_is_rebuilt(self):
+        """Integration-level version of the above: a pre-existing
+        landmask_ra.grd on disk with the wrong region (simulating the
+        leftover from an earlier crashed landmask run) must NOT be
+        silently reused -- `landmask` must be re-run to replace it."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            intf_in = self._build_case(tmpdir)
+            # Pre-create a "stale" landmask_ra.grd, as a crashed prior
+            # landmask run would have left behind.
+            open(os.path.join(tmpdir, "topo", "landmask_ra.grd"), "w").close()
+            config_path = os.path.join(tmpdir, "config.txt")
+            with open(config_path, "w") as f:
+                f.write("""\
+proc_stage = 1
+master_image = MASTER
+filter_wavelength = 200
+dec_factor = 2
+topo_phase = 1
+shift_topo = 0
+threshold_snaphu = 0.1
+threshold_geocode = 0
+region_cut =
+switch_land = 1
+defomax = 0
+near_interp = 0
+mask_water = 0
+""")
+            cwd0 = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                sys.argv = ["intf_batch", "NSR_A", intf_in, config_path]
+                self.calls.clear()
+                intf_batch.intf_batch()
+            finally:
+                os.chdir(cwd0)
+            calls = list(self.calls)
+        finally:
+            shutil.rmtree(tmpdir)
+
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        # _FakeCompletedProcess.stdout ("-100/100/-50/50", one token, no
+        # spaces) can't satisfy the >=5-field grdinfo -C parse, so the
+        # validator fails safe (treats the stale file as invalid) and
+        # landmask must still run despite the file already existing on
+        # disk.
+        landmask_calls = [c for c in run_cmds if c.startswith("landmask ")]
+        self.assertTrue(landmask_calls, "stale landmask_ra.grd was silently trusted")
+
     def test_correct_iono_unset_adds_zero_new_calls(self):
         """The regression-safety guarantee: correct_iono defaulting to 0/
         unset must be byte-for-byte the pre-existing command sequence."""
