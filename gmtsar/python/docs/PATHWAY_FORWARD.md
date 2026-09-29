@@ -1,5 +1,38 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-09-29 (2): `reuse_topo=1` still remade `trans.dat` on every run
+
+After the two fixes below, the user reported that `reuse_topo=1` was
+still remaking `trans.dat` every time -- it correctly logged "skipping
+'cleanup topo'" but `dem2topo_ra`'s own mtime-based reuse check then
+decided the existing `trans.dat` wasn't valid anymore anyway.
+
+Root cause: that reuse check (added 2026-09-23) compares `trans.dat`'s
+mtime against `topo/master.PRM`'s mtime (among others) -- but
+`_topo_stage` creates `topo/master.PRM` via a plain `cp ../SLC/<master>.
+PRM master.PRM` on **every single `intf_batch` run, unconditionally**,
+before `dem2topo_ra` is even invoked. A plain `cp` always stamps the
+destination with the current time, regardless of whether the source
+file's content changed at all -- so `topo/master.PRM` looked "just
+modified" on every run, no matter how old `../SLC/<master>.PRM` (the
+real source) actually was. That made the reuse check's own mtime
+comparison meaningless: `trans.dat` could never be newer than a file
+that gets rewritten with a fresh timestamp every run, so it always
+"correctly" concluded the cache was stale and recomputed -- the exact
+opposite of a bug in the comparison logic itself; the comparison was
+being fed a bad input.
+
+Fixed by changing that one `cp` to `cp -p` (preserve source mtime/mode)
+in `_topo_stage`. Verified the underlying shell assumption directly
+(`touch -t <old> src; cp -p src dst; stat dst` -> dst's mtime matches
+src's, not "now") and added
+`test_topo_stage_copies_master_prm_with_preserved_mtime` to
+`test_intf_batch_iono.py` asserting the exact command string. All 14
+tests in that file pass. With this fix, `topo/master.PRM`'s mtime only
+advances when `../SLC/<master>.PRM` itself is actually rewritten (e.g.
+during alignment/re-alignment) -- which is what the reuse check needs
+to make a meaningful decision at all.
+
 ## OPEN QUESTION 2026-09-29: split_spectrum-based ionospheric correction cannot work on NISAR data as ingested today
 
 Running `correct_iono=1` end-to-end on real NISAR_CSAF data surfaced a

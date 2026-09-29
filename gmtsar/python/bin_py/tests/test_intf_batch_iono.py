@@ -276,6 +276,24 @@ mask_water = 0
         # Everything else must still happen -- this only skips one command.
         self.assertTrue(any("dem2topo_ra" in c for c in run_cmds), run_cmds)
 
+    def test_topo_stage_copies_master_prm_with_preserved_mtime(self):
+        """Real bug found 2026-09-29 on real NISAR_CSAF data: reuse_topo=1
+        still remade trans.dat on every run. Root cause: dem2topo_ra's
+        trans.dat-reuse check compares trans.dat's mtime against
+        topo/master.PRM's mtime, but _topo_stage used a plain `cp` to
+        create topo/master.PRM -- which stamps a fresh "now" mtime on
+        EVERY run regardless of whether ../SLC/<master>.PRM's content
+        actually changed, permanently defeating the reuse check no
+        matter how old the real source PRM was. `cp -p` preserves the
+        source's mtime instead, so topo/master.PRM only looks "new" when
+        the source PRM itself was actually rewritten."""
+        calls = self._run_case("reuse_topo = 1\n")
+        run_cmds = [c[1] for c in calls if c[0] == "run"]
+        master_prm_copies = [c for c in run_cmds if c.endswith(" master.PRM")]
+        self.assertTrue(master_prm_copies, run_cmds)
+        for c in master_prm_copies:
+            self.assertTrue(c.startswith("cp -p "), f"not mtime-preserving: {c!r}")
+
     def test_correct_iono_1_default_skip_est_splits_once_per_scene(self):
         """3 unique scenes across 2 pairs -> exactly 3 split_spectrum calls
         (not 4), 6 iono filter calls (2 pairs x 3 sides), no estimate call

@@ -60,7 +60,21 @@ def _topo_stage(master, SAT, topo_phase, shift_topo, reuse_topo=0):
 
     print("DEM2TOPOPHASE - START")
     os.chdir("topo")
-    run(f"cp ../SLC/{master}.PRM master.PRM")
+    # Real bug found 2026-09-29 on real NISAR_CSAF data: reuse_topo=1
+    # still remade trans.dat on every run, even when nothing had actually
+    # changed. Root cause: dem2topo_ra's own trans.dat-reuse check (added
+    # 2026-09-23) compares trans.dat's mtime against topo/master.PRM's
+    # mtime -- but this plain `cp` recreates topo/master.PRM with a fresh
+    # "now" mtime on EVERY intf_batch run, unconditionally, regardless of
+    # whether ../SLC/<master>.PRM's actual content changed. That made
+    # master.PRM always look newer than any previously-cached trans.dat,
+    # so the reuse check (correctly, given what it was told) always
+    # decided to recompute. `cp -p` preserves the source file's mtime
+    # instead of stamping "now", so topo/master.PRM's mtime only advances
+    # when ../SLC/<master>.PRM itself is actually rewritten (e.g. during
+    # alignment) -- which is what the reuse check needs to make a
+    # meaningful comparison at all.
+    run(f"cp -p ../SLC/{master}.PRM master.PRM")
     run(f"ln -sf ../raw/{master}.LED .")
     if not check_file_report("dem.grd"):
         sys.exit("no DEM file found: dem.grd")
