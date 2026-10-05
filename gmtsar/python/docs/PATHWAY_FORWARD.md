@@ -1,5 +1,43 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-10-05: `diag_geom_vs_xcorr` -- diagnostic for a combined geometric + cross-correlation NISAR alignment
+
+Motivation (user request): evaluate combining the Sentinel-1 style
+DEM/orbit geometric alignment (`align_tops`) with the amplitude
+cross-correlation refinement `align_batch_nsr` uses today. Plan: (1) run
+this diagnostic on one pair; (2) only if the residuals justify it, build
+the combined method as an opt-in `align_method` config option defaulting
+to the current behavior.
+
+`utils/diag_geom_vs_xcorr MASTER REPEAT` changes nothing in the pipeline.
+It stages copies in a scratch dir, runs the same `SAT_baseline_py` +
+`xcorr_py -xsearch 128 -ysearch 128 -nx 40 -ny 40` commands as
+`_align_one` (or reuses `--xcorr-dat`), projects a decimated DEM into the
+master and into the repeat's RAW PRM (rshift = ashift = 0) with
+`SAT_llt2rat_py`, fits a polynomial to (repeat - master) pixel offsets,
+and reports measured - geometric residuals at the SNR > 20 xcorr
+locations: statistics, a plane fit, a 4x4 block-median map, and a noise
+floor (scatter of the measured offsets about their own robust cubic fit).
+Per-point table: `<work>/diag_residuals.txt`.
+
+Sign convention checked in the source on both sides: `xcorr_py`'s output
+offset (`xoff_out = xoff/ri - xfrac/ri + x_offset`) and `align_tops`'
+`dr = aligned - master` both mean "position in repeat minus position in
+master" in master pixel coordinates.
+
+Correction to a docstring in `align_batch_nsr`: it calls the warp a
+"10th-order" polynomial. `fitoffset_ra 10 10` passes 10 `gmt trend2d`
+model TERMS, i.e. a full cubic (3rd-order) surface. (Not edited yet.)
+
+Verification: 13 logic tests in `test_diag_geom_vs_xcorr.py` (polynomial
+fit/robust clipping, sign + bounds handling, DEM decimation, injected
+constant bias and range-gradient recovered, SNR cutoff, no-points case,
+`freq_xcorr.dat` parsing, and `main()` end to end with the projection
+tool and DEM reader mocked). NOT verified: the real `SAT_llt2rat_py`
+call (the sandbox has no numba/GMT/data) -- the interface used (ASCII
+`lon lat h` on stdin, 5 ASCII columns out, args `PRM precise`) was read
+from its source and matches how `dem2topo_ra` already calls it.
+
 ## Fixed 2026-09-29 (4): `landmask` crashed with a bare internal `RuntimeError` when `landmask_ra.grd` covers less than `region_cut`
 
 After the stale-file self-heal fix above correctly detected and rebuilt

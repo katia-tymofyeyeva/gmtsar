@@ -1,0 +1,448 @@
+#! /usr/bin/env python3
+"""diag_geom_vs_xcorr -- compare DEM-based geometric alignment offsets with
+the amplitude cross-correlation offsets align_batch_nsr actually uses.
+
+Added 2026-10-05 as step one of evaluating a combined alignment method
+(geometric prediction first, cross-correlation refinement second -- see
+PATHWAY_FORWARD.md). This script changes NOTHING in the pipeline: it
+works in its own scratch directory, reads raw/<stem>.{PRM,LED,SLC} and
+the DEM, and prints a report.
+
+What it does for ONE (master, repeat) pair:
+
+  1. Stage PRM copies + LED/SLC symlinks in a scratch dir (nothing in
+     raw/ is touched).
+  2. MEASURED offsets: exactly the commands align_batch_nsr runs --
+     SAT_baseline_py (seed rshift/ashift), then
+     `xcorr_py -xsearch 128 -ysearch 128 -nx 40 -ny 40` -> a 40x40 grid of
+     (range offset, azimuth offset, SNR). (Skipped with --xcorr-dat.)
+  3. GEOMETRIC offsets: decimate the DEM, project every point into the
+     master and the repeat with SAT_llt2rat_py (using the repeat's RAW
+     PRM, i.e. rshift = ashift = 0, so no seed offset is baked in), and
+     take aligned - master at master pixel coordinates -- the same recipe
+     align_tops uses for Sentinel-1. A low-order polynomial is fit to
+     those offsets so they can be evaluated at the xcorr locations.
+  4. Compare at the high-SNR xcorr locations: residual = measured -
+     geometric. Prints overall statistics, a plane fit to the residual,
+     a 4x4 block-median map, and a "noise floor" (scatter of the measured
+     offsets around their OWN robust cubic fit -- roughly what a perfect
+     geometric model could still not explain).
+  5. Writes <work>/diag_residuals.txt (one row per kept xcorr location).
+
+Sign convention (verified from the source, both sides):
+  xcorr_py's output offset  = (position in repeat) - (position in master)
+  align_tops' dr/da          = (repeat pixel)      - (master pixel)
+  of the same ground point, both in the master's pixel coordinates.
+
+Usage:
+  diag_geom_vs_xcorr MASTER_STEM REPEAT_STEM [options]
+    --raw-dir DIR     where raw/<stem>.{PRM,LED,SLC} live   (default raw)
+    --dem FILE        DEM in GMT .grd format                (default topo/dem.grd)
+    --work DIR        scratch dir (default diag_<master>_<repeat>)
+    --xcorr-dat FILE  reuse an existing freq_xcorr.dat instead of re-running
+                      SAT_baseline_py + xcorr_py
+    --snr N           SNR cutoff for xcorr points           (default 20)
+    --dem-points N    target number of decimated DEM points (default 250000)
+    --precise 0|1     SAT_llt2rat_py precision flag         (default 1)
+    --geo-order K     polynomial order for the geometric fit (default 3)
+
+Run from the case root (the directory that contains raw/ and topo/).
+Needs SAT_baseline_py, xcorr_py and SAT_llt2rat_py on PATH (i.e. bin/).
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+
+XCORR_ARGS = ["-xsearch", "128", "-ysearch", "128", "-nx", "40", "-ny", "40"]
+
+
+# --------------------------------------------------------------- PRM ---
+def read_prm_value(path, key):
+    """First whitespace token after `key =` in a PRM, or None."""
+    with open(path) as f:
+        for line in f:
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == key:
+                toks = v.split()
+                if toks:
+                    return toks[0]
+    return None
+
+
+def prm_dims(path):
+    """(num_rng_bins, num_patches * num_valid_az) -- same definition the
+    pipeline's own dimension checks use."""
+    nr = read_prm_value(path, "num_rng_bins")
+    npch = read_prm_value(path, "num_patches")
+    nva = read_prm_value(path, "num_valid_az")
+    if nr is None or npch is None or nva is None:
+        raise ValueError(f"{path}: missing num_rng_bins/num_patches/num_valid_az")
+    return int(float(nr)), int(float(npch)) * int(float(nva))
+
+
+# -------------------------------------------------------- polynomials ---
+def poly_exponents(order):
+    """All (i, j) with i + j <= order; term = u**i * v**j."""
+    return [(i, d - i) for d in range(order + 1) for i in range(d + 1)]
+
+
+def _design(u, v, order):
+    return np.column_stack([u ** i * v ** j for i, j in poly_exponents(order)])
+
+
+def _norm(x, y, dims):
+    return 2.0 * np.asarray(x, float) / dims[0] - 1.0, 2.0 * np.asarray(y, float) / dims[1] - 1.0
+
+
+def fit_poly(x, y, z, dims, order):
+    u, v = _norm(x, y, dims)
+    coef, *_ = np.linalg.lstsq(_design(u, v, order), np.asarray(z, float), rcond=None)
+    return coef
+
+
+def eval_poly(coef, x, y, dims, order):
+    u, v = _norm(x, y, dims)
+    return _design(u, v, order) @ coef
+
+
+def fit_poly_robust(x, y, z, dims, order, n_iter=4, k=3.0):
+    """Least squares with iterative 3-sigma (MAD) clipping. Returns
+    (coef, kept_mask)."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    z = np.asarray(z, float)
+    keep = np.ones(z.shape, bool)
+    n_terms = len(poly_exponents(order))
+    coef = None
+    for _ in range(n_iter):
+        if keep.sum() < n_terms:
+            break
+        coef = fit_poly(x[keep], y[keep], z[keep], dims, order)
+        res = z - eval_poly(coef, x, y, dims, order)
+        mad = np.median(np.abs(res[keep] - np.median(res[keep]))) * 1.4826
+        if mad == 0:
+            break
+        new_keep = np.abs(res) <= k * mad
+        if new_keep.sum() < n_terms or (new_keep == keep).all():
+            break
+        keep = new_keep
+    if coef is None:
+        coef = fit_poly(x, y, z, dims, order)
+    return coef, keep
+
+
+# ----------------------------------------------------------- statistics ---
+def robust_stats(v):
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return {"n": 0}
+    med = float(np.median(v))
+    return {
+        "n": int(v.size),
+        "mean": float(v.mean()),
+        "median": med,
+        "std": float(v.std()),
+        "rsigma": float(np.median(np.abs(v - med)) * 1.4826),
+        "maxabs": float(np.abs(v).max()),
+    }
+
+
+def block_medians(x, y, z, dims, nb=4):
+    """nb x nb grid of block medians (row 0 = lowest azimuth)."""
+    out = np.full((nb, nb), np.nan)
+    ix = np.clip((np.asarray(x) / dims[0] * nb).astype(int), 0, nb - 1)
+    iy = np.clip((np.asarray(y) / dims[1] * nb).astype(int), 0, nb - 1)
+    z = np.asarray(z, float)
+    for j in range(nb):
+        for i in range(nb):
+            m = (ix == i) & (iy == j)
+            if m.any():
+                out[j, i] = np.median(z[m])
+    return out
+
+
+# ------------------------------------------------------------ xcorr I/O ---
+def load_xcorr(path):
+    """freq_xcorr.dat rows: x  range_offset  y  azimuth_offset  SNR."""
+    d = np.loadtxt(path, ndmin=2)
+    if d.shape[1] < 5:
+        raise ValueError(f"{path}: expected 5 columns, got {d.shape[1]}")
+    return d[:, :5]
+
+
+# ------------------------------------------------------------- geometry ---
+def decimate_dem(data, x, y, target_points):
+    """Stride-subsample a (ny, nx) DEM to roughly target_points valid cells.
+    Returns ((N,3) array of lon, lat, h), stride."""
+    ny, nx = data.shape
+    stride = max(1, int(np.ceil(np.sqrt(ny * nx / float(target_points)))))
+    sub = np.asarray(data)[::stride, ::stride]
+    X, Y = np.meshgrid(np.asarray(x)[::stride], np.asarray(y)[::stride])
+    m = np.isfinite(sub)
+    return np.column_stack([X[m], Y[m], sub[m].astype(float)]), stride
+
+
+def geometric_offsets(m_rat, a_rat, m_dims, a_dims):
+    """From SAT_llt2rat rows (range_pix, azi_pix, ...) for the same ground
+    points in master and repeat: keep points inside BOTH images (as
+    align_tops does) and return (r_m, a_m, dr, da) with
+    dr = r_repeat - r_master, da = a_repeat - a_master."""
+    r_m, a_m = m_rat[:, 0], m_rat[:, 1]
+    r_a, a_a = a_rat[:, 0], a_rat[:, 1]
+    ok = (np.isfinite(r_m) & np.isfinite(a_m) & np.isfinite(r_a) & np.isfinite(a_a)
+          & (r_m > 0) & (r_m < m_dims[0]) & (a_m > 0) & (a_m < m_dims[1])
+          & (r_a > 0) & (r_a < a_dims[0]) & (a_a > 0) & (a_a < a_dims[1]))
+    return r_m[ok], a_m[ok], (r_a - r_m)[ok], (a_a - a_m)[ok]
+
+
+def run_llt2rat(prm_path, pts, precise):
+    """Pipe lon/lat/h rows through SAT_llt2rat_py (ASCII in/out, no bounds
+    filtering, so master and repeat outputs stay row-aligned)."""
+    buf = io.StringIO()
+    np.savetxt(buf, pts, fmt="%.9f %.9f %.3f")
+    res = subprocess.run(
+        ["SAT_llt2rat_py", os.path.abspath(prm_path), str(precise)],
+        input=buf.getvalue(), capture_output=True, text=True, check=True,
+    )
+    return np.loadtxt(io.StringIO(res.stdout), ndmin=2)
+
+
+def read_dem(path):
+    from gmt_grd_io import read_gmt_grd
+    data, x, y, _info = read_gmt_grd(path)
+    return data, x, y
+
+
+# ---------------------------------------------------------------- report ---
+def analyze(xc, geo, m_dims, snr_cut, geo_order):
+    """xc: (N,5) xcorr rows; geo: (r_m, a_m, dr, da). Returns a dict."""
+    r_m, a_m, dr_g, da_g = geo
+    c_r = fit_poly(r_m, a_m, dr_g, m_dims, geo_order)
+    c_a = fit_poly(r_m, a_m, da_g, m_dims, geo_order)
+    geo_fit_rms = (
+        float(np.sqrt(np.mean((dr_g - eval_poly(c_r, r_m, a_m, m_dims, geo_order)) ** 2))),
+        float(np.sqrt(np.mean((da_g - eval_poly(c_a, r_m, a_m, m_dims, geo_order)) ** 2))),
+    )
+
+    sel = xc[xc[:, 4] > snr_cut]
+    x, dr_m, y, da_m, snr = sel[:, 0], sel[:, 1], sel[:, 2], sel[:, 3], sel[:, 4]
+    dr_pred = eval_poly(c_r, x, y, m_dims, geo_order)
+    da_pred = eval_poly(c_a, x, y, m_dims, geo_order)
+    res_r = dr_m - dr_pred
+    res_a = da_m - da_pred
+
+    out = {
+        "n_total": int(xc.shape[0]), "n_kept": int(sel.shape[0]),
+        "n_geo_points": int(r_m.size), "geo_fit_rms": geo_fit_rms,
+        "geo_range": (float(dr_g.min()), float(dr_g.max()),
+                      float(da_g.min()), float(da_g.max())),
+        "x": x, "y": y, "snr": snr,
+        "dr_meas": dr_m, "dr_geo": dr_pred, "dr_res": res_r,
+        "da_meas": da_m, "da_geo": da_pred, "da_res": res_a,
+        "stats_r": robust_stats(res_r), "stats_a": robust_stats(res_a),
+        "center_geo": (float(eval_poly(c_r, [m_dims[0] / 2.0], [m_dims[1] / 2.0], m_dims, geo_order)[0]),
+                       float(eval_poly(c_a, [m_dims[0] / 2.0], [m_dims[1] / 2.0], m_dims, geo_order)[0])),
+    }
+    if sel.shape[0] >= 8:
+        for tag, res in (("r", res_r), ("a", res_a)):
+            coef, keep = fit_poly_robust(x, y, res, m_dims, 1)
+            terms = dict(zip(poly_exponents(1), coef))
+            plane_res = res - eval_poly(coef, x, y, m_dims, 1)
+            out[f"plane_{tag}"] = {
+                "const": float(terms[(0, 0)]),
+                "across_range": float(2.0 * terms[(1, 0)]),     # change over full width
+                "across_azimuth": float(2.0 * terms[(0, 1)]),   # change over full height
+                "rsigma_after": robust_stats(plane_res)["rsigma"],
+            }
+        # Noise floor: scatter of the measured offsets about their own
+        # robust cubic fit (what the current fitoffset_ra model leaves).
+        if sel.shape[0] >= 20:
+            for tag, z in (("r", dr_m), ("a", da_m)):
+                coef, keep = fit_poly_robust(x, y, z, m_dims, 3)
+                out[f"floor_{tag}"] = robust_stats(z - eval_poly(coef, x, y, m_dims, 3))["rsigma"]
+    out["blocks_r"] = block_medians(x, y, res_r, m_dims)
+    out["blocks_a"] = block_medians(x, y, res_a, m_dims)
+    return out
+
+
+def _fmt_stats(s):
+    if s.get("n", 0) == 0:
+        return "no points"
+    return (f"n={s['n']}  mean={s['mean']:+.3f}  median={s['median']:+.3f}  "
+            f"std={s['std']:.3f}  robust-sigma={s['rsigma']:.3f}  max|.|={s['maxabs']:.3f}")
+
+
+def print_report(res, seed, snr_cut, geo_order):
+    p = print
+    p("\n================ GEOMETRY vs CROSS-CORRELATION ================")
+    p(f"xcorr locations: {res['n_total']} total, {res['n_kept']} with SNR > {snr_cut}")
+    p(f"geometric points used: {res['n_geo_points']}  "
+      f"(order-{geo_order} fit rms: range {res['geo_fit_rms'][0]:.4f}, "
+      f"azimuth {res['geo_fit_rms'][1]:.4f} px -- should be tiny; if not, "
+      f"raise --geo-order)")
+    gr = res["geo_range"]
+    p(f"geometric offsets span: range [{gr[0]:+.2f}, {gr[1]:+.2f}] px, "
+      f"azimuth [{gr[2]:+.2f}, {gr[3]:+.2f}] px")
+    if seed:
+        p(f"SAT_baseline seed (rshift, ashift): ({seed[0]:+.1f}, {seed[1]:+.1f}); "
+          f"geometry at scene center: ({res['center_geo'][0]:+.2f}, {res['center_geo'][1]:+.2f})")
+    if res["n_kept"] == 0:
+        p("\nNo xcorr points above the SNR cutoff -- nothing to compare.")
+        return
+    p("\nRESIDUAL = measured (xcorr) - geometric, in pixels")
+    p(f"  range    : {_fmt_stats(res['stats_r'])}")
+    p(f"  azimuth  : {_fmt_stats(res['stats_a'])}")
+    for tag, name in (("r", "range"), ("a", "azimuth")):
+        pl = res.get(f"plane_{tag}")
+        if pl:
+            p(f"  {name} residual plane: const {pl['const']:+.3f}, "
+              f"change across range {pl['across_range']:+.3f}, "
+              f"across azimuth {pl['across_azimuth']:+.3f} px; "
+              f"scatter after plane removal (robust-sigma) {pl['rsigma_after']:.3f}")
+    fr, fa = res.get("floor_r"), res.get("floor_a")
+    if fr is not None:
+        p(f"\nNoise floor (measured offsets about their own robust cubic fit, "
+          f"robust-sigma): range {fr:.3f}, azimuth {fa:.3f} px")
+    for tag, name in (("r", "RANGE"), ("a", "AZIMUTH")):
+        b = res[f"blocks_{tag}"]
+        p(f"\n{name} residual, 4x4 block medians (rows: azimuth low->high, "
+          f"columns: range low->high):")
+        for row in b:
+            p("   " + "  ".join("   nan" if not np.isfinite(v) else f"{v:+6.3f}" for v in row))
+    p("\nHow to read this:")
+    p("  - residual median/const ~ 0 and robust-sigma ~ noise floor: geometry alone")
+    p("    explains the offsets; cross-correlation adds little.")
+    p("  - a roughly constant residual: a timing/near-range bias (a tie-point or")
+    p("    PRM-timing issue), easily absorbed by a low-order refinement.")
+    p("  - a plane/gradient: orbit/baseline error; a low-order (3-6 term) fit handles it.")
+    p("  - structure in the block map or sigma >> noise floor: geometry is missing")
+    p("    something real; the cross-correlation stage is doing essential work.")
+
+
+def write_residuals(path, res):
+    cols = ["x", "y", "snr", "dr_meas", "dr_geo", "dr_res", "da_meas", "da_geo", "da_res"]
+    arr = np.column_stack([res[c] for c in cols])
+    np.savetxt(path, arr, fmt="%.3f %.3f %.2f %.4f %.4f %.4f %.4f %.4f %.4f",
+               header=" ".join(cols))
+
+
+# ------------------------------------------------------------------ main ---
+def _need(tool):
+    if shutil.which(tool) is None:
+        sys.exit(f"diag_geom_vs_xcorr: '{tool}' not found on PATH (run from an "
+                 f"environment where GMTSAR's bin/ is on PATH).")
+
+
+def stage(raw_dir, work, master, repeat):
+    os.makedirs(work, exist_ok=True)
+    for stem in (master, repeat):
+        for ext in ("PRM", "SLC", "LED"):
+            src = os.path.abspath(os.path.join(raw_dir, f"{stem}.{ext}"))
+            if not os.path.isfile(src):
+                sys.exit(f"diag_geom_vs_xcorr: missing {src}")
+            dst = os.path.join(work, f"{stem}.{ext}")
+            if os.path.lexists(dst):
+                os.remove(dst)
+            if ext == "PRM":
+                shutil.copy(src, dst)
+            else:
+                os.symlink(src, dst)
+    # RAW repeat PRM kept separately for the geometry (rshift = ashift = 0).
+    shutil.copy(os.path.join(work, f"{repeat}.PRM"), os.path.join(work, f"{repeat}.raw.PRM"))
+
+
+def run_measured(work, master, repeat):
+    """The exact seed + xcorr commands align_batch_nsr runs."""
+    for tool in ("SAT_baseline_py", "xcorr_py"):
+        _need(tool)
+    rep_prm = f"{repeat}.PRM"
+    shutil.copy(os.path.join(work, rep_prm), os.path.join(work, f"{repeat}.PRM0"))
+    with open(os.path.join(work, rep_prm), "ab") as fh:
+        subprocess.run(["SAT_baseline_py", f"{master}.PRM", f"{repeat}.PRM0"],
+                       cwd=work, stdout=fh, check=True)
+    print("Running xcorr_py (40x40 grid; this takes a few minutes) ...", flush=True)
+    subprocess.run(["xcorr_py", f"{master}.PRM", rep_prm, *XCORR_ARGS,
+                    "-out", "freq_xcorr.dat"], cwd=work, check=True)
+    return os.path.join(work, "freq_xcorr.dat")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("master")
+    ap.add_argument("repeat")
+    ap.add_argument("--raw-dir", default="raw")
+    ap.add_argument("--dem", default="topo/dem.grd")
+    ap.add_argument("--work", default=None)
+    ap.add_argument("--xcorr-dat", default=None)
+    ap.add_argument("--snr", type=float, default=20.0)
+    ap.add_argument("--dem-points", type=int, default=250000)
+    ap.add_argument("--precise", type=int, default=1, choices=(0, 1))
+    ap.add_argument("--geo-order", type=int, default=3)
+    ns = ap.parse_args(argv)
+
+    work = ns.work or f"diag_{ns.master}_{ns.repeat}"
+    if not os.path.isfile(ns.dem):
+        sys.exit(f"diag_geom_vs_xcorr: DEM not found: {ns.dem}")
+    stage(ns.raw_dir, work, ns.master, ns.repeat)
+
+    if ns.xcorr_dat:
+        xc_path = ns.xcorr_dat
+    else:
+        xc_path = run_measured(work, ns.master, ns.repeat)
+    xc = load_xcorr(xc_path)
+
+    seed = None
+    rs = read_prm_value(os.path.join(work, f"{ns.repeat}.PRM"), "rshift")
+    as_ = read_prm_value(os.path.join(work, f"{ns.repeat}.PRM"), "ashift")
+    if rs is not None and as_ is not None:
+        seed = (float(rs), float(as_))
+
+    _need("SAT_llt2rat_py")
+    m_prm = os.path.join(work, f"{ns.master}.PRM")
+    a_prm = os.path.join(work, f"{ns.repeat}.raw.PRM")
+    for prm, nm in ((m_prm, "master"), (a_prm, "repeat(raw)")):
+        for k in ("rshift", "ashift", "sub_int_r", "sub_int_a"):
+            v = read_prm_value(prm, k)
+            if v is not None and float(v) != 0.0:
+                print(f"WARNING: {nm} PRM has {k} = {v}; SAT_llt2rat_py subtracts it, "
+                      f"so geometric offsets are shifted by that amount.")
+    m_dims = prm_dims(m_prm)
+    a_dims = prm_dims(a_prm)
+
+    print(f"Reading DEM {ns.dem} ...", flush=True)
+    data, x, y = read_dem(ns.dem)
+    pts, stride = decimate_dem(data, x, y, ns.dem_points)
+    print(f"DEM decimated by stride {stride} -> {len(pts)} points; "
+          f"projecting into master and repeat ...", flush=True)
+    m_rat = run_llt2rat(m_prm, pts, ns.precise)
+    a_rat = run_llt2rat(a_prm, pts, ns.precise)
+    if m_rat.shape[0] != a_rat.shape[0] or m_rat.shape[0] != len(pts):
+        sys.exit("diag_geom_vs_xcorr: SAT_llt2rat_py row counts differ between "
+                 f"master ({m_rat.shape[0]}), repeat ({a_rat.shape[0]}) and input "
+                 f"({len(pts)}); cannot pair points.")
+    geo = geometric_offsets(m_rat, a_rat, m_dims, a_dims)
+    if geo[0].size < 50:
+        sys.exit(f"diag_geom_vs_xcorr: only {geo[0].size} DEM points fall inside both "
+                 f"images -- is the DEM covering the scene?")
+
+    res = analyze(xc, geo, m_dims, ns.snr, ns.geo_order)
+    print_report(res, seed, ns.snr, ns.geo_order)
+    if res["n_kept"]:
+        out = os.path.join(work, "diag_residuals.txt")
+        write_residuals(out, res)
+        print(f"\nPer-point table written to {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
