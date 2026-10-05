@@ -29,7 +29,37 @@ Correction to a docstring in `align_batch_nsr`: it calls the warp a
 "10th-order" polynomial. `fitoffset_ra 10 10` passes 10 `gmt trend2d`
 model TERMS, i.e. a full cubic (3rd-order) surface. (Not edited yet.)
 
-Verification: 13 logic tests in `test_diag_geom_vs_xcorr.py` (polynomial
+FIRST REAL RESULT (2026-10-05, pair NSR_20260331A / NSR_20260412A, A135
+case, 827 of 1600 xcorr points with SNR > 20): geometry predicts the
+measured offsets very well. Sign convention confirmed (a flipped sign
+would leave residuals near +/-2x the ~19 px range offset, not ~0.1 px).
+Geometric offsets: range -22..-15 px, azimuth ~ -1740.2 lines (almost
+constant: the two frames start ~1.1 s apart); the SAT_baseline seed
+actually used was (-18, -1740). Residual = measured - geometric:
+range median -0.116 px, robust sigma 0.035 (noise floor 0.034);
+azimuth median -0.031 px, robust sigma 0.057 (floor 0.041). So (a) a
+roughly constant -0.12 px range bias remains (~0.36 m slant range;
+consistent with a date-to-date path delay or a small near-range/timing
+bias -- one pair can't separate them), (b) azimuth shows a small
+gradient (+0.17 px across the full range width), (c) scatter about those
+low-order terms is at the xcorr noise floor, and (d) a minority of
+SNR>20 points are gross outliers (max |residual| 62-76 px vs robust sigma
+~0.04; mean and median disagree). The 4x4 block map has NO high-SNR
+points in the far-range quarter (likely ocean/low coherence) -- exactly
+where today's cubic fit has to extrapolate. Conclusion so far: the
+combined method looks worthwhile mainly for (1) constraining the
+unmeasured far-range area with geometry, (2) rejecting outliers against
+the geometric prediction, and (3) fitting only 1-3 correction terms
+instead of 10. It does NOT make cross-correlation unnecessary: the
+-0.12 px range bias is real and only the data show it.
+
+Bug fixed in the diagnostic after that run: it reported the seed as
+(0, 0) because `read_prm_value` returned the FIRST `rshift`/`ashift`
+line; SAT_baseline_py appends its values below the raw PRM's own zero
+lines and the pipeline's `grep_value` takes the LAST. Now last-wins. Also
+added an outlier count and outlier-excluded statistics to the report.
+
+Verification: 15 logic tests in `test_diag_geom_vs_xcorr.py` (polynomial
 fit/robust clipping, sign + bounds handling, DEM decimation, injected
 constant bias and range-gradient recovered, SNR cutoff, no-points case,
 `freq_xcorr.dat` parsing, and `main()` end to end with the projection

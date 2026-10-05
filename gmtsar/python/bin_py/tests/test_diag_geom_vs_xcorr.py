@@ -151,6 +151,41 @@ class TestAnalyze(unittest.TestCase):
         diag.print_report(res, None, 1000.0, 3)  # must not raise
 
 
+class TestPrmAndOutliers(unittest.TestCase):
+    def test_read_prm_value_last_occurrence_wins(self):
+        """First real run (2026-10-05): SAT_baseline_py appends rshift/
+        ashift BELOW the raw PRM's own `rshift = 0`; the report showed
+        seed (0, 0) while xcorr_py was really seeded with (-18, -1740)."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.PRM")
+            with open(p, "w") as f:
+                f.write("rshift = 0\nashift = 0\nPRF = 1520\n"
+                        "rshift = -18\nashift = -1740\n")
+            self.assertEqual(diag.read_prm_value(p, "rshift"), "-18")
+            self.assertEqual(diag.read_prm_value(p, "ashift"), "-1740")
+            self.assertEqual(diag.read_prm_value(p, "PRF"), "1520")
+            self.assertIsNone(diag.read_prm_value(p, "nope"))
+
+    def test_outliers_counted_and_excluded_from_clean_stats(self):
+        rng = np.random.default_rng(7)
+        n = 40
+        xs = np.linspace(2000, DIMS[0] - 2000, n)
+        ys = np.linspace(2000, DIMS[1] - 2000, n)
+        X, Y = np.meshgrid(xs, ys)
+        x, y = X.ravel(), Y.ravel()
+        dr = true_dr(x, y) + rng.normal(0, 0.02, x.size)
+        da = true_da(x, y) + rng.normal(0, 0.02, x.size)
+        dr[:10] += 60.0          # 10 gross range outliers
+        da[10:15] -= 75.0        # 5 gross azimuth outliers
+        xc = np.column_stack([x, dr, y, da, np.full(x.size, 60.0)])
+        r = rng.uniform(100, DIMS[0] - 100, 3000)
+        a = rng.uniform(100, DIMS[1] - 100, 3000)
+        res = diag.analyze(xc, (r, a, true_dr(r, a), true_da(r, a)), DIMS, 20.0, 3)
+        self.assertEqual(res["n_outliers"], 15)
+        self.assertLess(res["stats_r_clean"]["std"], 0.05)
+        self.assertGreater(res["stats_r"]["std"], 1.0)
+
+
 class TestXcorrParse(unittest.TestCase):
     def test_load_xcorr_format(self):
         with tempfile.TemporaryDirectory() as d:

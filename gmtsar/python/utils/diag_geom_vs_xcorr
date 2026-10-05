@@ -65,7 +65,15 @@ XCORR_ARGS = ["-xsearch", "128", "-ysearch", "128", "-nx", "40", "-ny", "40"]
 
 # --------------------------------------------------------------- PRM ---
 def read_prm_value(path, key):
-    """First whitespace token after `key =` in a PRM, or None."""
+    """First whitespace token after `key =` in a PRM, or None.
+
+    LAST occurrence wins, like the pipeline's own grep_value / get_prm:
+    SAT_baseline_py APPENDS its results (rshift, ashift, ...) to the end
+    of the repeat PRM, below the raw PRM's own `rshift = 0` line. Real bug
+    found on the first real run (2026-10-05): returning the FIRST match
+    reported the seed as (0, 0) while xcorr_py was actually seeded with
+    (-18, -1740)."""
+    found = None
     with open(path) as f:
         for line in f:
             if "=" not in line:
@@ -74,8 +82,8 @@ def read_prm_value(path, key):
             if k.strip() == key:
                 toks = v.split()
                 if toks:
-                    return toks[0]
-    return None
+                    found = toks[0]
+    return found
 
 
 def prm_dims(path):
@@ -270,6 +278,15 @@ def analyze(xc, geo, m_dims, snr_cut, geo_order):
             for tag, z in (("r", dr_m), ("a", da_m)):
                 coef, keep = fit_poly_robust(x, y, z, m_dims, 3)
                 out[f"floor_{tag}"] = robust_stats(z - eval_poly(coef, x, y, m_dims, 3))["rsigma"]
+    # Outliers: SNR > cutoff does not guarantee a good match (the first real
+    # run had max|residual| ~ 60-76 px against a robust sigma of ~0.04 px).
+    # Count points disagreeing with geometry by more than 0.5 px in either axis.
+    bad = (np.abs(res_r) > 0.5) | (np.abs(res_a) > 0.5)
+    out["n_outliers"] = int(bad.sum())
+    good = ~bad
+    if good.sum() > 0:
+        out["stats_r_clean"] = robust_stats(res_r[good])
+        out["stats_a_clean"] = robust_stats(res_a[good])
     out["blocks_r"] = block_medians(x, y, res_r, m_dims)
     out["blocks_a"] = block_medians(x, y, res_a, m_dims)
     return out
@@ -302,6 +319,10 @@ def print_report(res, seed, snr_cut, geo_order):
     p("\nRESIDUAL = measured (xcorr) - geometric, in pixels")
     p(f"  range    : {_fmt_stats(res['stats_r'])}")
     p(f"  azimuth  : {_fmt_stats(res['stats_a'])}")
+    p(f"  outliers (|residual| > 0.5 px in either axis): {res['n_outliers']} of {res['n_kept']}")
+    if "stats_r_clean" in res:
+        p(f"  without outliers, range  : {_fmt_stats(res['stats_r_clean'])}")
+        p(f"  without outliers, azimuth: {_fmt_stats(res['stats_a_clean'])}")
     for tag, name in (("r", "range"), ("a", "azimuth")):
         pl = res.get(f"plane_{tag}")
         if pl:
