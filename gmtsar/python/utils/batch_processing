@@ -95,7 +95,7 @@ def batch_processing():
             if not os.path.isfile(stem_data_in):
                 sys.exit(f"[ERROR]: {stem_data_in} not found — run step 1 "
                          f"(preprocessing) first")
-            run(f"align_batch_nsr {stem_data_in}")
+            run(f"align_batch_nsr {stem_data_in} {config}")
         else:
             # data_type = RAW for SAR raw inputs, SLC for already-focused.
             # ALOS/ERS/ENVI/ENVI_SCAN are RAW; SLC and *_SLC variants are SLC.

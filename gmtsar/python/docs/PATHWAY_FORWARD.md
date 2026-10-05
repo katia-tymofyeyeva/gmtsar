@@ -1,5 +1,58 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-10-05 (2): NISAR alignment DEFAULT is now DEM geometry + xcorr correction
+
+**What changed.** For NSR_A/NSR_B, `fitoffset_ra 10 10 freq_xcorr.dat 20`
+(10-term cubic fitted to xcorr points only) is replaced by
+`geom_align_lib.fit_alignment_grids` (CLI form: `fitoffset_ra_geo`):
+
+1. `xcorr_py` runs exactly as before (measured offsets).
+2. Geometric offsets from the DEM (decimated ~250k pts) projected into
+   master and RAW repeat (`<aligned>.PRM0`, rshift=ashift=0) via
+   `SAT_llt2rat_py`; cubic fit in master pixels (the `align_tops` recipe).
+3. A robust constant+plane (3 terms/axis) correction is fitted to
+   measured - geometric at SNR>20 points; points >0.5 px from geometry are
+   excluded.
+4. Geometry + correction is evaluated on a 256-px lattice over the whole
+   amp grid region and passed through the SAME `gmt surface -rp -I64/64
+   -T.3` + FLIPUD tail as `fitoffset_ra` -> r.grd/a.grd -> `resamp_py ... 5`
+   unchanged.
+
+**Why** (real pairs, NSR_20260331A/0412A/0424A vs master): geometry varies
+~7 px across the scene (much less than the ±128 px search) and the diagnostic
+supported using it as the base model (see the diagnostic entry below for
+the measured agreement); the geometric model also covers low-correlation regions where the cubic fit
+extrapolated. One resample, no two-pass needed.
+
+**Decisions (user):** missing DEM -> FATAL with clear error (no silent
+fallback); applies to both `align_batch_nsr` (DEM `topo/dem.grd`; checked
+before any work) and the single-pair path (`p2p_stages._xcorr_and_fitoffset`,
+DEM `../topo/dem.grd`). Escape hatch: `align_method = xcorr` in the stack
+config (`batch_processing` now passes the config to `align_batch_nsr`), or
+`align_method = "xcorr"` in p2p `config.py`, or env
+`GMTSAR_NSR_ALIGN_METHOD=xcorr`.
+
+**Fail-loud guards:** < 50 DEM points inside both images; > 4 of 64 blocks
+with < 3 DEM points; > 50% of xcorr points off geometry by > 0.5 px;
+fitted correction > 2 px anywhere. Each stops with a message pointing to
+`diag_geom_vs_xcorr` / `align_method = xcorr`.
+
+**Verified:** 33 synthetic/mocked unit tests (`test_geom_align_lib.py`,
+`test_diag_geom_vs_xcorr.py`): polynomial recovery, correction fit, outlier
+rejection, lattice = geometry + correction, command sequence, DEM-missing
+fatal, method precedence. **NOT verified (no gmt/SAT_llt2rat_py/data in the
+sandbox):** end-to-end run, and the r.grd/a.grd orientation after
+`gmt surface` + FLIPUD for the new lattice (identical commands to
+`fitoffset_ra`, but untested on real data). **Validate** on a real pair:
+compare coherence/fringes of an interferogram from the new vs
+`align_method = xcorr` alignment before relying on it for a stack.
+
+Notes: `diag_geom_vs_xcorr` still carries its own copies of the polynomial
+helpers (not refactored onto `geom_align_lib`, to leave the validated
+diagnostic untouched). Pair 2 diagnostic (NSR_20260424A) agreed with
+Pair 1 (see entry below for Pair 1 numbers). The `align_batch_nsr`
+"10th-order" docstring was corrected to "10-term (full cubic)".
+
 ## Built 2026-10-05: `diag_geom_vs_xcorr` -- diagnostic for a combined geometric + cross-correlation NISAR alignment
 
 Motivation (user request): evaluate combining the Sentinel-1 style

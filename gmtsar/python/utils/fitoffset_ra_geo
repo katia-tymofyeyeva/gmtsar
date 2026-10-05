@@ -1,0 +1,28 @@
+#! /usr/bin/env python3
+"""fitoffset_ra_geo -- r.grd / a.grd from DEM geometry + xcorr correction.
+
+Drop-in alternative to `fitoffset_ra 10 10 freq_xcorr.dat 20` for NISAR.
+See geom_align_lib.py for the method.
+
+Usage:  fitoffset_ra_geo master.PRM aligned_raw.PRM dem.grd freq_xcorr.dat [SNR]
+
+  aligned_raw.PRM must be the repeat's PRM WITHOUT the rshift/ashift lines
+  SAT_baseline_py appends (the pipelines keep it as <aligned>.PRM0).
+Run in the directory holding amp*.grd and freq_xcorr.dat; writes r.grd and
+a.grd there.
+"""
+import sys
+
+import geom_align_lib as gal
+
+
+def main():
+    if len(sys.argv) not in (5, 6):
+        sys.exit(__doc__)
+    master, raw, dem, xcorr = sys.argv[1:5]
+    snr = float(sys.argv[5]) if len(sys.argv) == 6 else 20.0
+    gal.geo_fitoffset(master, raw, dem, xcorr, snr=snr)
+
+
+if __name__ == "__main__":
+    main()

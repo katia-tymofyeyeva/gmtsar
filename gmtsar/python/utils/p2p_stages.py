@@ -246,7 +246,16 @@ def _xcorr_and_fitoffset(SAT, master, aligned):
         run("rm -f amp*.grd")
         run(f"slc2amp {master}.PRM 4 amp-{master}.grd")
         time_run(f"xcorr_py {master}.PRM {aligned}.PRM -xsearch 128 -ysearch 128 -nx 40 -ny 40", "xcorr_py")
-        time_run("fitoffset_ra 10 10 freq_xcorr.dat 20", "fitoffset_ra")
+        # Default (2026-10-05): DEM geometry + xcorr correction via
+        # geom_align_lib (needs ../topo/dem.grd; missing DEM is fatal).
+        # `align_method = "xcorr"` in config.py (or env
+        # GMTSAR_NSR_ALIGN_METHOD=xcorr) restores fitoffset_ra 10 10.
+        import geom_align_lib
+        _cfg = sys.modules.get('config')
+        _am = getattr(_cfg, 'align_method', None)
+        if _am is not None and geom_align_lib.ENV_METHOD not in os.environ:
+            os.environ[geom_align_lib.ENV_METHOD] = str(_am)
+        geom_align_lib.fit_alignment_grids(master, aligned, dem_path="../topo/dem.grd")
     else:
         time_run(f"xcorr_py {master}.PRM {aligned}.PRM {_XCORR_DEFAULT_PARAMS}", "xcorr_py")
         fit_dim = "3 3" if SAT in _SAT_RAW_INPUT else "2 2"

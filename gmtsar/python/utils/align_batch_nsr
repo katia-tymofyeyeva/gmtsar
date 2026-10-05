@@ -8,8 +8,9 @@ algorithm from the one NISAR is actually validated against. The proven
 NISAR alignment method — exercised end-to-end via the single-pair
 `p2p_processing NSR_A`/`NSR_B` path (see utils/p2p_stages.py:
 P2P2FocusAlign's NSR branch, `_xcorr_and_fitoffset`, `_resamp_and_swap`) —
-is pure amplitude cross-correlation against the master (no DEM involved at
-this stage) followed by a 10th-order 2D polynomial warp. This script applies
+is amplitude cross-correlation against the master followed by a 10-term
+(full cubic) 2D polynomial warp -- now refined with a DEM geometric model
+by default, see below. This script applies
 that exact per-pair recipe in a loop against one master, the same way
 align_batch generalizes align.csh to a stack for other sensors.
 
@@ -19,12 +20,21 @@ NSR_<date><band> stems — i.e. raw/stem_data.in as written by
 pre_proc_batch_nsr, or an equivalent hand-built file in the same format
 (line 1 = master stem, line 2+ = repeat stems).
 
-Usage:  align_batch_nsr data.in
+Usage:  align_batch_nsr data.in [config]
+
+Alignment method (changed 2026-10-05): DEFAULT is DEM geometry (as Sentinel-1
+align_tops) refined by a low-order fit to the xcorr offsets -- needs
+topo/dem.grd, stops with an error if missing. `align_method = xcorr` in the
+config (or env GMTSAR_NSR_ALIGN_METHOD=xcorr) restores xcorr-only alignment.
+See geom_align_lib.py / docs/PATHWAY_FORWARD.md.
 """
 import os
 import sys
 
 from gmtsar_lib import run, grep_value, check_file_report
+from geom_align_lib import fit_alignment_grids
+
+_CONFIG = None  # set in align_batch_nsr() from optional 2nd argv
 
 
 def _stage_slc_inputs(name):
@@ -58,7 +68,11 @@ def _align_one(master, aligned):
     run("rm -f amp*.grd")
     run(f"slc2amp {master}.PRM 4 amp-{master}.grd")
     run(f"xcorr_py {master}.PRM {aligned}.PRM -xsearch 128 -ysearch 128 -nx 40 -ny 40")
-    run("fitoffset_ra 10 10 freq_xcorr.dat 20")
+    # Default (2026-10-05): DEM geometry refined by the xcorr offsets
+    # (geom_align_lib); `align_method = xcorr` restores the old
+    # fitoffset_ra 10 10 behaviour. Runs in-process so a missing DEM or an
+    # inconsistent geometry/xcorr pair stops the batch here, not 3 steps later.
+    fit_alignment_grids(master, aligned, config_path=_CONFIG, dem_path="../topo/dem.grd")
 
     run(f"resamp_py {master}.PRM {aligned}.PRM {aligned}.PRMresamp {aligned}.SLCresamp 5 r.grd a.grd")
     run(f"rm -f {aligned}.SLC")
@@ -123,9 +137,11 @@ def _verify_aligned(master, aligned):
 
 
 def align_batch_nsr():
-    if len(sys.argv) != 2:
+    global _CONFIG
+    if len(sys.argv) not in (2, 3):
         sys.exit(
-            "Usage: align_batch_nsr data.in\n"
+            "Usage: align_batch_nsr data.in [config]\n"
+            "  config: optional; read for `align_method` (geo [default] | xcorr)\n"
             "  data.in: line 1 = master stem (NSR_<date><band>), line 2+ = repeat stems\n"
             "  (typically raw/stem_data.in, written by pre_proc_batch_nsr)\n"
             "  Run from the top-level case directory."
@@ -133,6 +149,17 @@ def align_batch_nsr():
     data_in = sys.argv[1]
     if not os.path.isfile(data_in):
         sys.exit(f"no data.in file: {data_in}")
+    if len(sys.argv) == 3:
+        _CONFIG = os.path.abspath(sys.argv[2])
+        if not os.path.isfile(_CONFIG):
+            sys.exit(f"no config file: {_CONFIG}")
+    # Fail before any work if the default method can't run.
+    from geom_align_lib import align_method
+    if align_method(_CONFIG) == "geo" and not os.path.isfile("topo/dem.grd"):
+        sys.exit("align_batch_nsr: FATAL: topo/dem.grd not found. NISAR alignment now "
+                 "uses the DEM (geometric model refined by cross-correlation). Create "
+                 "it first, or set `align_method = xcorr` in the config to use "
+                 "cross-correlation only.")
 
     with open(data_in) as f:
         names = [ln.strip() for ln in f if ln.strip()]
