@@ -125,11 +125,25 @@ class TestCorrection(unittest.TestCase):
         self.assertAlmostEqual(float(gal.eval_poly(c["coef_r"], x[:1], y[:1], DIMS, 1)[0]), 0.2, places=6)
 
     def test_too_many_outliers_exits(self):
-        x = np.linspace(0, DIMS[0], 100)
-        y = np.linspace(0, DIMS[1], 100)
-        res = np.full(100, 3.0)
+        rng = np.random.default_rng(6)
+        x = rng.uniform(0, DIMS[0], 100)
+        y = rng.uniform(0, DIMS[1], 100)
+        res = rng.uniform(-3.0, 3.0, 100)  # scattered, no common value
         with self.assertRaises(SystemExit):
             gal.fit_correction(x, y, res, res, DIMS)
+
+    def test_uniform_bias_above_outlier_limit_is_not_outlier(self):
+        # real case 2026-10-12: all points ~+0.58 px off geometry (tight), plus a few wild ones
+        rng = np.random.default_rng(7)
+        x = rng.uniform(0, DIMS[0], 400)
+        y = rng.uniform(0, DIMS[1], 400)
+        res_r = 0.58 + rng.normal(0, 0.03, 400)
+        res_a = -0.12 + rng.normal(0, 0.03, 400)
+        res_r[:10] = 60.0
+        c = gal.fit_correction(x, y, res_r, res_a, DIMS, order=1)
+        self.assertEqual(c["n_outliers"], 10)
+        v = gal.eval_poly(c["coef_r"], np.array([DIMS[0] / 2]), np.array([DIMS[1] / 2]), DIMS, 1)[0]
+        self.assertAlmostEqual(float(v), 0.58, delta=0.02)
 
     def test_large_correction_exits(self):
         rng = np.random.default_rng(5)

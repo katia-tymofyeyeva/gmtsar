@@ -37,6 +37,16 @@ with < 3 DEM points; > 50% of xcorr points off geometry by > 0.5 px;
 fitted correction > 2 px anywhere. Each stops with a message pointing to
 `diag_geom_vs_xcorr` / `align_method = xcorr`.
 
+**Bug found on first real stack run (2026-10-12, NSR_20260611A):** the
+"outlier" test measured residuals against ZERO, so a scene with a tight,
+uniform +0.58 px range bias (robust-sigma 0.033 px, diagnostic report) had
+799 of 812 points rejected and the batch stopped. Fixed: outliers are now
+measured about each axis's MEDIAN residual (the bias itself is still
+bounded by the 2 px max-correction guard). Regression test
+`test_uniform_bias_above_outlier_limit_is_not_outlier`. Observed bias varies
+by date (~-0.12 px for 0412A, ~+0.6 px for 0611A), consistent with a
+per-acquisition timing offset that the constant term absorbs.
+
 **Verified:** 33 synthetic/mocked unit tests (`test_geom_align_lib.py`,
 `test_diag_geom_vs_xcorr.py`): polynomial recovery, correction fit, outlier
 rejection, lattice = geometry + correction, command sequence, DEM-missing

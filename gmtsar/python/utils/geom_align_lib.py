@@ -336,11 +336,18 @@ def fit_correction(x, y, res_r, res_a, dims, order=1, outlier_px=0.5,
     Returns dict(coef_r, coef_a, order, n_used, n_outliers, max_corr)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
     res_r, res_a = np.asarray(res_r, float), np.asarray(res_a, float)
-    bad = (np.abs(res_r) > outlier_px) | (np.abs(res_a) > outlier_px)
+    # Outliers are measured about the MEDIAN residual of each axis, not about
+    # zero: a uniform geometry-vs-SLC timing bias (seen up to ~0.6 px on
+    # real data, 2026-10-12) is exactly what the constant term of the
+    # correction absorbs and must not be mistaken for disagreement. The
+    # 2 px max_correction_px guard below still limits the bias itself.
+    med_r, med_a = float(np.median(res_r)), float(np.median(res_a))
+    bad = (np.abs(res_r - med_r) > outlier_px) | (np.abs(res_a - med_a) > outlier_px)
     n_out = int(bad.sum())
     if n_out > max_outlier_frac * x.size:
-        sys.exit(f"geom_align_lib: {n_out} of {x.size} cross-correlation points disagree "
-                 f"with the geometric model by more than {outlier_px} px -- geometry and "
+        sys.exit(f"geom_align_lib: {n_out} of {x.size} cross-correlation points are more than "
+                 f"{outlier_px} px from the median measured-minus-geometric residual "
+                 f"(median: range {med_r:+.3f}, azimuth {med_a:+.3f} px) -- geometry and "
                  f"correlation are inconsistent (wrong DEM/orbit, or bad correlation). "
                  f"Inspect with diag_geom_vs_xcorr, or set align_method = xcorr.")
     good = ~bad
@@ -421,7 +428,7 @@ def geo_fitoffset(master_prm, aligned_raw_prm, dem_path, xcorr_dat, snr=20.0,
           f"azimuth [{geo['span'][2]:+.2f}, {geo['span'][3]:+.2f}] px")
     print(f"GEO ALIGN: {corr['n_used']} of {sel.shape[0]} xcorr points (SNR > {snr}) used "
           f"for the order-{corr_order} correction; {corr['n_outliers']} rejected as "
-          f"outliers (> 0.5 px from geometry); max |correction| in scene "
+          f"outliers (> 0.5 px from the median residual); max |correction| in scene "
           f"{corr['max_corr']:.3f} px")
     print(f"GEO ALIGN: correction coefficients (normalized coords, terms "
           f"{poly_exponents(corr_order)}): range {np.round(corr['coef_r'], 4).tolist()}, "
