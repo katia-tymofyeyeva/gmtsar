@@ -454,7 +454,14 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
             run("ln -sf ../../topo/landmask_ra.grd .")
         print(f"\nSNAPHU - START (threshold {threshold_snaphu})")
         interp_flag = 1 if near_interp == 1 else 0
-        run(f"snaphu {threshold_snaphu} {defomax} {interp_flag} {region_cut}")
+        # Real bug found 2026-10-19 (first geocoded NISAR stack): this called
+        # bare `snaphu`, which on PATH is the real snaphu C binary (built from
+        # snaphu-v2.0.7), NOT the Python wrapper -- the wrapper is installed as
+        # `snaphu.py` (p2p_stages.py calls snaphu.py / the native snaphu module).
+        # The C binary took "0.3" as the input file and "0" as the line length
+        # -> "line length must be positive integer", rc=1, run() only WARNs,
+        # and every pair silently went on to geocode with no unwrapped phase.
+        run(f"snaphu.py {threshold_snaphu} {defomax} {interp_flag} {region_cut}")
         print("SNAPHU - END")
     else:
         print("SKIP UNWRAP PHASE")

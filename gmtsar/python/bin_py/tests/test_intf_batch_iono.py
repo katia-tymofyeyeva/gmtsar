@@ -237,9 +237,13 @@ mask_water = 0
         self.assertTrue(landmask_calls, "expected at least one landmask call")
         for c in landmask_calls:
             self.assertIn("-100/100/-50/50", c, c)
-        snaphu_calls = [c for c in run_cmds if c.startswith("snaphu ")]
+        snaphu_calls = [c for c in run_cmds if c.startswith("snaphu.py ")]
+        self.assertTrue(snaphu_calls, "expected snaphu.py calls")
         for c in snaphu_calls:
             self.assertIn("-100/100/-50/50", c, c)
+        # Regression 2026-10-19: bare `snaphu` is the C binary, not the wrapper.
+        bare = [c for c in run_cmds if c.startswith("snaphu ")]
+        self.assertEqual(bare, [], f"bare snaphu (C binary) called: {bare}")
 
     def test_landmask_ra_valid_for_region_true_positive_and_negative(self):
         """Real bug found 2026-09-29 on real NISAR_CSAF data: even after

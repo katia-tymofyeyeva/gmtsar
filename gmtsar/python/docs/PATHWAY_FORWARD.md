@@ -1,5 +1,20 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Fixed 2026-10-19: `intf_batch` never unwrapped -- it called the snaphu C binary instead of `snaphu.py`
+
+Real run (geocoded NISAR stack, `threshold_snaphu` > 0): log showed
+`snaphu v2.0.7 / line length must be positive integer / WARN: command exited
+1: snaphu 0.3 0 0 0/53316/0/54720` for every pair, and no unwrapped output.
+Root cause: `intf_batch` ran `snaphu <thr> <defomax> <interp> <region>`; on PATH
+`snaphu` is the real C binary (bin/), not the Python wrapper, which is installed
+as `snaphu.py`. The binary read "0.3" as the input file and "0" as the line
+length. `run()` only WARNs on rc!=0, so each pair carried on and geocoded with
+no unwrapped phase. Fix: call `snaphu.py` (as `p2p_stages.py` does). Test:
+`test_intf_batch_iono` now asserts `snaphu.py` is used and bare `snaphu` never is.
+Same latent bug NOT fixed (out of scope, untested path):
+`utils/p2p_ALOS2_SCAN_Frame:216` (`run(f"snaphu {threshold} {defomax} {region}")`,
+also missing the interp argument).
+
 ## Built 2026-10-05 (2): NISAR alignment DEFAULT is now DEM geometry + xcorr correction
 
 **What changed.** For NSR_A/NSR_B, `fitoffset_ra 10 10 freq_xcorr.dat 20`
