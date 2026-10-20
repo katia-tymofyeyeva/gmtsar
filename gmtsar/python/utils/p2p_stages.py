@@ -267,7 +267,10 @@ def _resamp_and_swap(master, aligned, SAT=None):
     For NSR_A/NSR_B: uses resamp factor 5 with r.grd/a.grd alignment grids
     (produced by fitoffset_ra). Other SATs use factor 4 without those grids."""
     if SAT in _NSR_FAMILY:
-        time_run(f"resamp_py {master}.PRM {aligned}.PRM {aligned}.PRMresamp {aligned}.SLCresamp 5 r.grd a.grd", "resamp_py")
+        # NISAR: upstream's C resamp (Doppler-aware azimuth sinc) by default;
+        # GMTSAR_NSR_RESAMP=py -> resamp_py. See geom_align_lib.nsr_resamp_command.
+        import geom_align_lib
+        time_run(geom_align_lib.nsr_resamp_command(master, aligned), "resamp")
     else:
         time_run(f"resamp_py {master}.PRM {aligned}.PRM {aligned}.PRMresamp {aligned}.SLCresamp 4", "resamp_py")
     delete(f"{aligned}.SLC")

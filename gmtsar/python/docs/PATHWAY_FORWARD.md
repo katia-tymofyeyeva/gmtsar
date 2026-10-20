@@ -1,5 +1,22 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Changed 2026-10-20: NISAR resampling now uses upstream's C `resamp` (Doppler-aware azimuth sinc)
+
+Upstream gmtsar/gmtsar (merged 2026-10) added `bisinc_nisar` / `sinc_one_nisar`
+to `resamp.c`: for intrp=5 (grid shifts) the azimuth sinc weights carry a
+Doppler phase ramp, fixed 950 Hz wrapped to the PRF (NISAR RSLC is zero-Doppler
+geometry but the complex azimuth interpolation benefits from it). `resamp_py`
+(our port) has only the plain 4x4 bisinc, so the merge alone would not have
+reached the Python pipeline. Per the user ("I trust the resampling done by the
+upstream repo"), `align_batch_nsr` and `p2p_stages` (NSR only) now run the C
+`resamp` (identical CLI: `resamp M.PRM A.PRM out.PRM out.SLC 5 r.grd a.grd`)
+via `geom_align_lib.nsr_resamp_command`. `GMTSAR_NSR_RESAMP=py` restores
+`resamp_py`. A loud WARNING is printed if the installed `resamp` binary lacks
+`bisinc_nisar` (C code not rebuilt after the merge -> old kernel silently).
+Not changed: `resamp_py` itself, non-NISAR SATs. The 950 Hz constant is
+upstream's, not verified here. NOT verified on real data: C resamp speed and
+output vs resamp_py; compare coherence of an interferogram from each.
+
 ## Fixed 2026-10-19: `intf_batch` never unwrapped -- it called the snaphu C binary instead of `snaphu.py`
 
 Real run (geocoded NISAR stack, `threshold_snaphu` > 0): log showed

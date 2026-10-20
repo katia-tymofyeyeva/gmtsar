@@ -324,6 +324,50 @@ def fit_alignment_grids(master, aligned, config_path=None, dem_path="../topo/dem
     return method
 
 
+ENV_RESAMP = "GMTSAR_NSR_RESAMP"
+
+
+def nsr_resamp_command(master, aligned):
+    """Command that resamples `aligned` onto `master` for NISAR (mode 5,
+    r.grd/a.grd), run in SLC/.
+
+    Default (2026-10-20): the C `resamp` binary, which after the upstream merge
+    contains the NISAR Doppler-aware azimuth sinc (bisinc_nisar /
+    sinc_one_nisar, fixed 950 Hz Doppler wrapped to the PRF) -- upstream's
+    own resampler, trusted over our Python port. `resamp_py` (the older
+    plain 4x4 bisinc, no Doppler term) remains available with
+    GMTSAR_NSR_RESAMP=py. Identical command-line interface.
+
+    Prints a loud warning if the installed `resamp` does not contain the
+    NISAR code (binary not rebuilt after the merge): it would silently
+    resample with the old plain kernel."""
+    import shutil
+    choice = os.environ.get(ENV_RESAMP, "c").strip().lower()
+    if choice not in ("c", "py"):
+        sys.exit(f"{ENV_RESAMP} must be 'c' or 'py', got {choice!r}")
+    out = f"{aligned}.PRMresamp {aligned}.SLCresamp 5 r.grd a.grd"
+    if choice == "py":
+        print(f"NSR RESAMP: resamp_py (plain bisinc, no Doppler term) -- {ENV_RESAMP}=py")
+        return f"resamp_py {master}.PRM {aligned}.PRM {out}"
+    exe = shutil.which("resamp")
+    if exe is None:
+        sys.exit("NSR RESAMP: the C `resamp` binary is not on PATH. Build/install it "
+                 f"(install.py --rebuild) or set {ENV_RESAMP}=py to use resamp_py.")
+    try:
+        with open(os.path.realpath(exe), "rb") as f:
+            has_nisar = b"bisinc_nisar" in f.read()
+    except OSError:
+        has_nisar = None
+    if has_nisar is False:
+        print("NSR RESAMP: WARNING: the installed `resamp` does NOT contain the NISAR "
+              "Doppler-aware interpolation (bisinc_nisar) -- it was built before the "
+              "upstream merge. Rebuild with: python3 gmtsar/python/install.py "
+              "--system conda --rebuild")
+    else:
+        print("NSR RESAMP: C resamp (NISAR Doppler-aware azimuth sinc)")
+    return f"resamp {master}.PRM {aligned}.PRM {out}"
+
+
 # ----------------------------------------------- correction + grid build ---
 def fit_correction(x, y, res_r, res_a, dims, order=1, outlier_px=0.5,
                    max_outlier_frac=0.5, max_correction_px=2.0):

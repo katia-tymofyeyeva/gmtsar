@@ -266,5 +266,50 @@ class TestFitAlignmentGrids(unittest.TestCase):
         self.assertEqual(args[:4], ("M.PRM", "A.PRM0", "dem.grd", "freq_xcorr.dat"))
 
 
+class TestNsrResampCommand(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop(gal.ENV_RESAMP, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _fake_resamp(self, content):
+        exe = os.path.join(self.d, "resamp")
+        with open(exe, "wb") as f:
+            f.write(content)
+        os.chmod(exe, 0o755)
+        return mock.patch.dict(os.environ, {"PATH": self.d})
+
+    def test_py_choice_uses_resamp_py(self):
+        os.environ[gal.ENV_RESAMP] = "py"
+        cmd = gal.nsr_resamp_command("M", "A")
+        self.assertEqual(cmd, "resamp_py M.PRM A.PRM A.PRMresamp A.SLCresamp 5 r.grd a.grd")
+
+    def test_default_uses_c_resamp_same_args(self):
+        with self._fake_resamp(b"\x00bisinc_nisar\x00"):
+            cmd = gal.nsr_resamp_command("M", "A")
+        self.assertEqual(cmd, "resamp M.PRM A.PRM A.PRMresamp A.SLCresamp 5 r.grd a.grd")
+
+    def test_old_binary_warns(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with self._fake_resamp(b"old resamp"), contextlib.redirect_stdout(buf):
+            gal.nsr_resamp_command("M", "A")
+        self.assertIn("WARNING", buf.getvalue())
+
+    def test_missing_binary_is_fatal(self):
+        with mock.patch.dict(os.environ, {"PATH": self.d}):
+            with self.assertRaises(SystemExit):
+                gal.nsr_resamp_command("M", "A")
+
+    def test_bad_choice_exits(self):
+        os.environ[gal.ENV_RESAMP] = "x"
+        with self.assertRaises(SystemExit):
+            gal.nsr_resamp_command("M", "A")
+
+
 if __name__ == "__main__":
     unittest.main()

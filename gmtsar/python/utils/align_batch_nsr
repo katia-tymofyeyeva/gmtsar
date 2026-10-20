@@ -32,7 +32,7 @@ import os
 import sys
 
 from gmtsar_lib import run, grep_value, check_file_report
-from geom_align_lib import fit_alignment_grids
+from geom_align_lib import fit_alignment_grids, nsr_resamp_command
 
 _CONFIG = None  # set in align_batch_nsr() from optional 2nd argv
 
@@ -74,7 +74,7 @@ def _align_one(master, aligned):
     # inconsistent geometry/xcorr pair stops the batch here, not 3 steps later.
     fit_alignment_grids(master, aligned, config_path=_CONFIG, dem_path="../topo/dem.grd")
 
-    run(f"resamp_py {master}.PRM {aligned}.PRM {aligned}.PRMresamp {aligned}.SLCresamp 5 r.grd a.grd")
+    run(nsr_resamp_command(master, aligned))
     run(f"rm -f {aligned}.SLC")
     run(f"mv {aligned}.SLCresamp {aligned}.SLC")
     run(f"cp {aligned}.PRMresamp {aligned}.PRM")
