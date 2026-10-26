@@ -293,12 +293,40 @@ class TestNsrResampCommand(unittest.TestCase):
             cmd = gal.nsr_resamp_command("M", "A")
         self.assertEqual(cmd, "resamp M.PRM A.PRM A.PRMresamp A.SLCresamp 5 r.grd a.grd")
 
-    def test_old_binary_warns(self):
+    def _repo(self, bin_newer, src_has=True):
+        repo = tempfile.mkdtemp()
+        os.makedirs(os.path.join(repo, "bin")); os.makedirs(os.path.join(repo, "gmtsar"))
+        exe = os.path.join(repo, "bin", "resamp")
+        src = os.path.join(repo, "gmtsar", "resamp.c")
+        open(exe, "wb").write(b"stripped binary, no names")
+        os.chmod(exe, 0o755)
+        open(src, "w").write("bisinc_nisar" if src_has else "plain")
+        t = 1_000_000
+        os.utime(src, (t, t))
+        os.utime(exe, (t + 100, t + 100) if bin_newer else (t - 100, t - 100))
+        return exe
+
+    def test_stripped_binary_newer_than_source_is_ok(self):
+        self.assertEqual(gal.resamp_binary_status(self._repo(bin_newer=True)), "ok")
+
+    def test_binary_older_than_nisar_source_is_stale_and_warns(self):
         import io, contextlib
+        exe = self._repo(bin_newer=False)
+        self.assertEqual(gal.resamp_binary_status(exe), "stale")
         buf = io.StringIO()
-        with self._fake_resamp(b"old resamp"), contextlib.redirect_stdout(buf):
+        with mock.patch.dict(os.environ, {"PATH": os.path.dirname(exe)}), contextlib.redirect_stdout(buf):
             gal.nsr_resamp_command("M", "A")
         self.assertIn("WARNING", buf.getvalue())
+
+    def test_source_without_nisar_or_missing_is_unknown(self):
+        self.assertEqual(gal.resamp_binary_status(self._repo(bin_newer=False, src_has=False)), "unknown")
+        self.assertEqual(gal.resamp_binary_status(self._fake_exe_only()), "unknown")
+
+    def _fake_exe_only(self):
+        d = tempfile.mkdtemp()
+        exe = os.path.join(d, "resamp")
+        open(exe, "wb").write(b"x")
+        return exe
 
     def test_missing_binary_is_fatal(self):
         with mock.patch.dict(os.environ, {"PATH": self.d}):

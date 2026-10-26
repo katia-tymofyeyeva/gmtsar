@@ -353,19 +353,47 @@ def nsr_resamp_command(master, aligned):
     if exe is None:
         sys.exit("NSR RESAMP: the C `resamp` binary is not on PATH. Build/install it "
                  f"(install.py --rebuild) or set {ENV_RESAMP}=py to use resamp_py.")
-    try:
-        with open(os.path.realpath(exe), "rb") as f:
-            has_nisar = b"bisinc_nisar" in f.read()
-    except OSError:
-        has_nisar = None
-    if has_nisar is False:
-        print("NSR RESAMP: WARNING: the installed `resamp` does NOT contain the NISAR "
-              "Doppler-aware interpolation (bisinc_nisar) -- it was built before the "
-              "upstream merge. Rebuild with: python3 gmtsar/python/install.py "
-              "--system conda --rebuild")
+    status = resamp_binary_status(exe)
+    if status == "stale":
+        print("NSR RESAMP: WARNING: the installed `resamp` appears OLDER than the "
+              "repo's resamp.c (which contains the NISAR Doppler-aware interpolation, "
+              "bisinc_nisar) -- it was probably not rebuilt after the upstream merge and "
+              "would use the plain kernel. Rebuild with: python3 "
+              "gmtsar/python/install.py --system conda --rebuild")
+    elif status == "unknown":
+        print("NSR RESAMP: C resamp (could not verify it was built from the NISAR "
+              "source; compare against GMTSAR_NSR_RESAMP=py if in doubt)")
     else:
         print("NSR RESAMP: C resamp (NISAR Doppler-aware azimuth sinc)")
     return f"resamp {master}.PRM {aligned}.PRM {out}"
+
+
+def resamp_binary_status(exe):
+    """'ok' | 'stale' | 'unknown' for the installed C `resamp`.
+
+    Installed binaries are normally stripped (no symbol/function names),
+    so look for the NISAR code in the binary only as a positive hint
+    ('ok'). Otherwise compare build times with the repo's gmtsar/resamp.c
+    (found relative to the real binary: <repo>/bin/resamp ->
+    <repo>/gmtsar/resamp.c): if that source has bisinc_nisar and is
+    NEWER than the binary, the binary predates it -> 'stale'; if the binary
+    is at least as new -> 'ok'; if the source can't be found -> 'unknown'."""
+    real = os.path.realpath(exe)
+    try:
+        with open(real, "rb") as f:
+            if b"bisinc_nisar" in f.read():
+                return "ok"
+    except OSError:
+        return "unknown"
+    src = os.path.join(os.path.dirname(os.path.dirname(real)), "gmtsar", "resamp.c")
+    try:
+        with open(src, "rb") as f:
+            src_has = b"bisinc_nisar" in f.read()
+        if not src_has:
+            return "unknown"
+        return "stale" if os.path.getmtime(src) > os.path.getmtime(real) else "ok"
+    except OSError:
+        return "unknown"
 
 
 # ----------------------------------------------- correction + grid build ---
