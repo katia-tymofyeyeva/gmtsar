@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""align_batch_nsr_B -- Stage 1 of the Frequency-B ionosphere workflow:
+register every B-band SLC to the B master, stack-wise, using the offsets that
+align_batch_nsr already found for the A band.
+
+Usage (from the case directory, after align_batch_nsr):
+    align_batch_nsr_B raw/stem_data.in
+
+data.in = the A-stem list (line 1 master).  For each repeat it needs
+SLC/offsets/<A stem>_r.grd and _a.grd (saved by align_batch_nsr) and
+raw/NSR_<date>B.{PRM,SLC,LED}.  Output goes to SLC_B/ (leaves SLC/ alone):
+    SLC_B/NSR_<date>B.{PRM,SLC,LED}   resampled to the B master geometry
+
+B offsets are NOT re-estimated (5 MHz is too noisy): they are derived from A's
+grids through the slant-range relation in iono_b_lib.  The resampler is the
+same C `resamp` mode 5 used for A.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value, check_file_report
+from geom_align_lib import nsr_resamp_command
+from iono_b_lib import build_b_grids, slc_params, check_ab_timing
+
+
+def b_stem(a_stem):
+    if not a_stem.endswith("A"):
+        sys.exit(f"align_batch_nsr_B: expected A stem ending in 'A', got {a_stem}")
+    return a_stem[:-1] + "B"
+
+
+def _stage(name):
+    run(f"cp ../raw/{name}.PRM .")
+    run(f"ln -sf ../raw/{name}.SLC .")
+    run(f"ln -sf ../raw/{name}.LED .")
+
+
+def _align_one_B(mA, aA, mB, aB):
+    _stage(aB)
+    run(f"cp {aB}.PRM {aB}.PRM0")
+    run(f"SAT_baseline_py {mB}.PRM {aB}.PRM0 >> {aB}.PRM")
+    # B grids derived from A's saved grids; A PRMs live in ../SLC (already
+    # aligned: near_range / rng_samp_rate fields are the master's after resamp,
+    # so use the RAW A PRMs for the per-date near range).
+    d = build_b_grids(f"../raw/{mA}.PRM", f"../raw/{aA}.PRM",
+                      f"{mB}.PRM", f"../raw/{aB}.PRM",
+                      f"../SLC/offsets/{aA}_r.grd", f"../SLC/offsets/{aA}_a.grd",
+                      out_r="r.grd", out_a="a.grd")
+    print(f"  B grids: range offset {d['r_min']:.3f} .. {d['r_max']:.3f} px "
+          f"(mean {d['r_mean']:.3f}); x_inc_B {d['inc_x_B']:.3f}")
+    run(nsr_resamp_command(mB, aB))
+    run(f"rm -f {aB}.SLC")
+    run(f"mv {aB}.SLCresamp {aB}.SLC")
+    run(f"cp {aB}.PRMresamp {aB}.PRM")
+
+
+def _verify(mB, aB):
+    for ext in ("PRM", "SLC", "LED"):
+        if not check_file_report(f"{aB}.{ext}"):
+            sys.exit(f"align_batch_nsr_B: FATAL: {aB}.{ext} missing after resampling "
+                     f"(run() does not raise: scroll back for a WARN from resamp)")
+    dm = (int(grep_value(f"{mB}.PRM", "num_rng_bins", 3)),
+          int(grep_value(f"{mB}.PRM", "num_patches", 3)) * int(grep_value(f"{mB}.PRM", "num_valid_az", 3)))
+    da = (int(grep_value(f"{aB}.PRM", "num_rng_bins", 3)),
+          int(grep_value(f"{aB}.PRM", "num_patches", 3)) * int(grep_value(f"{aB}.PRM", "num_valid_az", 3)))
+    if dm != da:
+        sys.exit(f"align_batch_nsr_B: FATAL: {aB} is {da}, master {mB} is {dm} after resamp")
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    with open(sys.argv[1]) as f:
+        names = [ln.strip() for ln in f if ln.strip()]
+    if len(names) < 2:
+        sys.exit("align_batch_nsr_B: need master + at least one repeat")
+    master, repeats = names[0], names[1:]
+    mB = b_stem(master)
+    for a in (master, *repeats):
+        b = b_stem(a)
+        for p in (f"raw/{a}.PRM", f"raw/{b}.PRM", f"raw/{b}.SLC", f"raw/{b}.LED"):
+            if not os.path.isfile(p):
+                sys.exit(f"missing {p}")
+    for a in repeats:
+        for s in ("r", "a"):
+            p = f"SLC/offsets/{a}_{s}.grd"
+            if not os.path.isfile(p):
+                sys.exit(f"missing {p}: rerun align_batch_nsr (this version saves the "
+                         f"offset grids) before align_batch_nsr_B")
+    # A/B timing for every date up front, before any work
+    for a in (master, *repeats):
+        check_ab_timing(slc_params(f"raw/{a}.PRM"), slc_params(f"raw/{b_stem(a)}.PRM"))
+
+    print("START ALIGN A STACK OF NISAR FREQUENCY-B IMAGES\n")
+    os.makedirs("SLC_B", exist_ok=True)
+    run("cleanup SLC_B")
+    os.chdir("SLC_B")
+    _stage(mB)
+    n = len(repeats)
+    for i, a in enumerate(repeats, 1):
+        print(f"working on {b_stem(a)}  [ {i} / {n} ]")
+        _align_one_B(master, a, mB, b_stem(a))
+        _verify(mB, b_stem(a))
+    run("rm -f *.PRM0 *resamp r.grd a.grd")
+    os.chdir("..")
+    print("\nEND ALIGN A STACK OF NISAR FREQUENCY-B IMAGES")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""ab_params -- Stage 0 of the Frequency-B ionosphere workflow: tabulate the
+A and B band parameters (centre frequency, range pixel, PRF, near range,
+dimensions, A/B timing check) for every date in a stem list.
+
+Usage (from the case directory):
+    ab_params raw/stem_data.in [raw_dir]
+
+stem_data.in lists A stems (NSR_<date>A); the B stem is NSR_<date>B.  Needs
+raw/NSR_<date>{A,B}.PRM from pre_proc_batch_nsr.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from iono_b_lib import ab_table, format_table
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        sys.exit(__doc__)
+    with open(sys.argv[1]) as f:
+        stems = [ln.strip() for ln in f if ln.strip()]
+    raw = sys.argv[2] if len(sys.argv) == 3 else "raw"
+    rows = ab_table(stems, raw)
+    print(format_table(rows))
+    bad = [r["stem"] for r in rows if r["timing"] != "ok"]
+    if bad:
+        print(f"\nWARNING: {len(bad)} date(s) with missing B or A/B timing mismatch: {bad}")
+        sys.exit(1)
+    print("\nall dates: B present, A/B PRF and line timing consistent")
+
+
+if __name__ == "__main__":
+    main()

@@ -74,6 +74,12 @@ def _align_one(master, aligned):
     # inconsistent geometry/xcorr pair stops the batch here, not 3 steps later.
     fit_alignment_grids(master, aligned, config_path=_CONFIG, dem_path="../topo/dem.grd")
 
+    # Keep this date's offset grids: align_batch_nsr_B derives the Frequency-B
+    # grids from them (the final cleanup below deletes r.grd/a.grd).
+    run("mkdir -p offsets")
+    run(f"cp r.grd offsets/{aligned}_r.grd")
+    run(f"cp a.grd offsets/{aligned}_a.grd")
+
     run(nsr_resamp_command(master, aligned))
     run(f"rm -f {aligned}.SLC")
     run(f"mv {aligned}.SLCresamp {aligned}.SLC")

@@ -1,5 +1,27 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-11-04: Frequency-B ionosphere workflow, Stages 0–1 (parameter table + stack-wise B registration) — UNTESTED ON REAL DATA
+
+Plan: `NISAR_freqB_ionosphere_strategy.md` (closure-preserving: raw per-pair dispersive estimates → per-date
+screens by network inversion → one linear filter per date → correction `I_i^f − I_j^f`; screens exported per
+date). Decision (user): reuse the C pipeline wherever possible, now and in future development — B is
+registered with C `resamp` mode 5, B interferograms/filtering with C `intf`/`filter`, `snaphu.py`, `geocode`;
+only the network inversion, per-date filtering and screen export are new Python.
+
+- `utils/iono_b_lib.py`: `slc_params`, `check_ab_timing` (A/B PRF and first-line time must match, since the
+  azimuth grid is reused), `b_range_grid` / `build_b_grids` (B offset grids from A's: `ΔR = (nA_r−nA_m) + rA·dA`,
+  `rB = (ΔR − (nB_r−nB_m))/dB`; `resamp` mode 5 uses only grid data + increments, so B keeps A's rows and
+  `x_inc_B = x_inc_A·dA/dB`), `ab_table`.
+- `utils/ab_params raw/stem_data.in` — Stage 0 table (fA, fB, pixel sizes, PRF, near range, dims, timing OK?).
+- `utils/align_batch_nsr_B raw/stem_data.in` — resamples every `raw/NSR_<date>B` to the B master into `SLC_B/`
+  (needs `SLC/offsets/<A stem>_{r,a}.grd`).
+- `utils/align_batch_nsr` now keeps each date's `r.grd`/`a.grd` in `SLC/offsets/` (previously deleted).
+  **Existing stacks must rerun align_batch_nsr** to get them.
+- Tests: `bin_py/tests/test_iono_b_lib.py` (5 run, 1 skipped without netCDF4: the grid round-trip).
+- To verify on real data: that near range = `near_range + x·c/(2fs)` for both bands (B coherence over stable
+  ground after resampling is the check); B centre frequency/pixel size from `ab_params`; that the A grids'
+  y-rows map to the same azimuth lines for B.
+
 ## Changed 2026-10-20: NISAR resampling now uses upstream's C `resamp` (Doppler-aware azimuth sinc)
 
 Upstream gmtsar/gmtsar (merged 2026-10) added `bisinc_nisar` / `sinc_one_nisar`
