@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""intf_batch_B -- Stage 2, step 1 of the Frequency-B ionosphere workflow:
+form the B-band interferogram of every pair, with the same C tools as the
+A band (dem2topo_ra, intf, filter), on a grid whose ground cell size matches
+the A-band products already in intf/<pair>/.
+
+Usage (case directory, after align_batch_nsr_B and intf_batch):
+    intf_batch_B intf.in batch.config
+
+Output: iono_B/<ref_id>_<rep_id>/{phase,phasefilt,corr,amp1,amp2,...}.grd
+        iono_B/topo_B/topo_ra.grd   (B-geometry topography phase, made once)
+
+Details:
+  * topography: dem2topo_ra on the B master PRM (B geometry; no remapping of
+    A's topo_ra).
+  * decimation: `filter` is called in its explicit form with the range step
+    (B pixels) and azimuth step taken from A's phasefilt.grd, so one B cell
+    covers the same ground as one A cell.  If A's range step is not an integer
+    number of B pixels the script says so and B is made as close as possible.
+  * filter wavelength: config key iono_B_filter_wavelength, default =
+    filter_wavelength (the A value).  For the dispersive estimate the intent is
+    NOT to filter further here; this only sets the multilook/decimation grid.
+  * resumable: pairs with iono_B/<pair>/phasefilt.grd are skipped.
+"""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value
+from iono_b_lib import b_decimation, slc_params
+
+
+def _cfg(path, key, default=""):
+    with open(path) as f:
+        for ln in f:
+            p = ln.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def b_stem(a):
+    if not a.endswith("A"):
+        sys.exit(f"expected an A stem ending in 'A', got {a}")
+    return a[:-1] + "B"
+
+
+def grd_incs(path):
+    """(x_inc, y_inc) from gmt grdinfo -C (columns 8, 9)."""
+    out = subprocess.run(f"gmt grdinfo -C {path}", shell=True, stdout=subprocess.PIPE
+                         ).stdout.decode().split()
+    return float(out[7]), float(out[8])
+
+
+def make_topo_B(master_a):
+    mb = b_stem(master_a)
+    os.makedirs("iono_B/topo_B", exist_ok=True)
+    cwd = os.getcwd()
+    os.chdir("iono_B/topo_B")
+    if not os.path.isfile("topo_ra.grd"):
+        run(f"cp -p ../../SLC_B/{mb}.PRM master.PRM")
+        run(f"ln -sf ../../raw/{mb}.LED .")
+        run("ln -sf ../../topo/dem.grd .")
+        run("dem2topo_ra master.PRM dem.grd")
+    ok = os.path.isfile("topo_ra.grd")
+    os.chdir(cwd)
+    if not ok:
+        sys.exit("dem2topo_ra did not produce iono_B/topo_B/topo_ra.grd")
+
+
+def one_pair(ref, rep, wl, dec_args, sub):
+    b_ref, b_rep = b_stem(ref), b_stem(rep)
+    pair = f"iono_B/{sub}"
+    os.makedirs(pair, exist_ok=True)
+    cwd = os.getcwd()
+    os.chdir(pair)
+    for s in (b_ref, b_rep):
+        run(f"ln -sf ../../raw/{s}.LED .")
+        run(f"ln -sf ../../SLC_B/{s}.SLC .")
+        run(f"cp ../../SLC_B/{s}.PRM .")
+    run("ln -sf ../topo_B/topo_ra.grd .")
+    run(f"intf {b_ref}.PRM {b_rep}.PRM -topo topo_ra.grd")
+    run(f"filter {b_ref}.PRM {b_rep}.PRM {wl} 1 {dec_args['range_dec']} {dec_args['azimuth_dec']}")
+    ok = all(os.path.isfile(f) for f in ("phase.grd", "phasefilt.grd", "corr.grd"))
+    os.chdir(cwd)
+    return ok
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    intf_in, config = sys.argv[1], sys.argv[2]
+    for p in (intf_in, config, "topo/dem.grd"):
+        if not os.path.isfile(p):
+            sys.exit(f"missing {p}")
+    master = _cfg(config, "master_image")
+    if not master:
+        sys.exit("master_image not set in config")
+    wl = _cfg(config, "iono_B_filter_wavelength") or _cfg(config, "filter_wavelength", "200")
+    with open(intf_in) as f:
+        pairs = [ln.strip().split(":", 1) for ln in f if ":" in ln]
+    if not pairs:
+        sys.exit("no ref:rep lines in " + intf_in)
+    for ref, rep in pairs:
+        for s in (b_stem(ref), b_stem(rep)):
+            for ext in ("PRM", "SLC"):
+                if not os.path.isfile(f"SLC_B/{s}.{ext}"):
+                    sys.exit(f"missing SLC_B/{s}.{ext}: run align_batch_nsr_B first")
+
+    d_a = slc_params(f"SLC/{master}.PRM")["dr"]
+    d_b = slc_params(f"SLC_B/{b_stem(master)}.PRM")["dr"]
+
+    # A reference grid steps from the first pair that has an A product
+    ids = {}
+    def pid(s):
+        if s not in ids:
+            ids[s] = int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3)))
+        return ids[s]
+    x_inc = y_inc = None
+    for ref, rep in pairs:
+        g = f"intf/{pid(ref)}_{pid(rep)}/phasefilt.grd"
+        if os.path.isfile(g):
+            x_inc, y_inc = grd_incs(g)
+            break
+    if x_inc is None:
+        sys.exit("no A-band intf/<pair>/phasefilt.grd found to take the grid steps from; "
+                 "run intf_batch first")
+    dec_args = b_decimation(x_inc, y_inc, d_a, d_b)
+    print(f"A grid step: {x_inc:g} px range ({x_inc * d_a:.1f} m), {y_inc:g} lines azimuth")
+    print(f"B filter call: range_dec={dec_args['range_dec']} B px "
+          f"({dec_args['range_dec'] * d_b:.1f} m), azimuth_dec={dec_args['azimuth_dec']} lines, "
+          f"filter wavelength {wl} m")
+    if dec_args["note"]:
+        print("WARNING: " + dec_args["note"])
+
+    make_topo_B(master)
+    print("\nSTART FORM A STACK OF B-BAND INTERFEROGRAMS")
+    failed = []
+    for i, (ref, rep) in enumerate(pairs, 1):
+        sub = f"{pid(ref)}_{pid(rep)}"
+        if os.path.isfile(f"iono_B/{sub}/phasefilt.grd"):
+            print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            continue
+        print(f"[{i}/{len(pairs)}] {sub}")
+        if not one_pair(ref, rep, wl, dec_args, sub):
+            failed.append(sub)
+            print(f"FAILED {sub}: phase/phasefilt/corr.grd missing (scroll back for a WARN)")
+    print("\nEND FORM A STACK OF B-BAND INTERFEROGRAMS")
+    if failed:
+        sys.exit(f"{len(failed)} pair(s) failed: {failed}")
+
+    # compare B and A grid sizes for the first completed pair
+    ref, rep = pairs[0]
+    sub = f"{pid(ref)}_{pid(rep)}"
+    bx, by = grd_incs(f"iono_B/{sub}/phasefilt.grd")
+    print(f"\nB phasefilt step: {bx:g} B px = {bx * d_b:.1f} m range, {by:g} lines azimuth "
+          f"(A: {x_inc * d_a:.1f} m, {y_inc:g} lines)")
+    if abs(bx * d_b - x_inc * d_a) > 0.05 * x_inc * d_a or abs(by - y_inc) > 1e-6:
+        print("WARNING: B and A grid steps differ; check before the pair estimates")
+
+
+if __name__ == "__main__":
+    main()

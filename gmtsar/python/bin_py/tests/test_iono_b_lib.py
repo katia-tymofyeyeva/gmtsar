@@ -128,6 +128,30 @@ class TestBuildGrids(unittest.TestCase):
         self.assertAlmostEqual(diag["scale"], DA / DB, places=9)
 
 
+class TestBDecimation(unittest.TestCase):
+    def test_exact(self):
+        r = ib.b_decimation(16, 4, DA, DB)
+        self.assertEqual((r["range_dec"], r["azimuth_dec"], r["exact"]), (2, 4, True))
+
+    def test_inexact_finer_than_b(self):
+        r = ib.b_decimation(4, 4, DA, DB)       # 0.5 B px
+        self.assertFalse(r["exact"])
+        self.assertEqual(r["range_dec"], 1)
+        self.assertIn("not an integer", r["note"])
+
+    def test_inexact_noninteger(self):
+        r = ib.b_decimation(20, 4, DA, DB)      # 2.5 B px
+        self.assertFalse(r["exact"])
+
+    def test_azimuth_rules(self):
+        ib.b_decimation(16, 3, DA, DB)          # odd ok
+        ib.b_decimation(16, 8, DA, DB)          # multiple of 4 ok
+        with self.assertRaises(ValueError):
+            ib.b_decimation(16, 6, DA, DB)
+        with self.assertRaises(ValueError):
+            ib.b_decimation(16, 2.5, DA, DB)
+
+
 class TestTable(unittest.TestCase):
     def test_table_and_missing(self):
         d = tempfile.mkdtemp()

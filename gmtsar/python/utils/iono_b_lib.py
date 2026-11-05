@@ -132,6 +132,34 @@ def build_b_grids(mA_prm, aA_prm, mB_prm, aB_prm, r_grd, a_grd,
             "scale": scale}
 
 
+def b_decimation(x_inc_a, y_inc_a, d_a, d_b, tol=0.02):
+    """Decimation for the B-band `filter` call so that B's output cells have the
+    same ground size as A's existing products.
+
+    x_inc_a, y_inc_a  increments of A's phasefilt.grd (pixels of the A SLC)
+    d_a, d_b          A and B range pixel sizes (m)
+    Returns dict(range_dec, azimuth_dec, exact, note).  range_dec is in B
+    pixels.  `exact` is False when A's range step is not an integer number of
+    B pixels (or is finer than one B pixel): B is then as close as possible /
+    coarser and A must be coarsened to B's grid before comparison.
+    `filter`'s explicit-decimation form needs azimuth_dec odd or a multiple of 4
+    (PRF > 1000: az_lks = 4 otherwise it divides it into a non-integer)."""
+    rb = x_inc_a * d_a / d_b
+    rd = max(1, int(round(rb)))
+    exact = rb >= 1 and abs(rb - round(rb)) <= tol * max(rb, 1.0)
+    note = "" if exact else (
+        f"A range step {x_inc_a:g} px = {rb:.3f} B px: not an integer >= 1; "
+        f"B uses {rd} px ({rd * d_b:.1f} m vs A's {x_inc_a * d_a:.1f} m)")
+    az = int(round(y_inc_a))
+    if abs(y_inc_a - az) > 1e-6 or az < 1:
+        raise ValueError(f"A azimuth increment {y_inc_a} is not a positive integer")
+    if az % 2 == 0 and az % 4 != 0:
+        raise ValueError(
+            f"A azimuth increment {az} is even but not a multiple of 4: filter's "
+            f"explicit-decimation form would compute a non-integer azimuth step")
+    return {"range_dec": rd, "azimuth_dec": az, "exact": exact, "note": note}
+
+
 def ab_table(stems, raw_dir="raw"):
     """Rows (dict) of A/B parameters for each A stem (NSR_<date>A); B stem is
     the same with trailing 'B'.  Missing B files give a row with b=None."""
