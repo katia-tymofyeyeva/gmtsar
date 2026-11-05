@@ -83,10 +83,15 @@ def main():
     os.chdir(root)
 
     b = corr_stats(f"{pair}/corr.grd")
-    a = corr_stats(f"intf/{sub}/corr.grd")
+    a_dir = None
+    for cand in (sub, f"{ids[1]}_{ids[0]}"):      # pairs may be stored earlier-date-first
+        if os.path.isfile(f"intf/{cand}/corr.grd"):
+            a_dir = cand
+            break
+    a = corr_stats(f"intf/{a_dir}/corr.grd") if a_dir else None
     print("\nCOHERENCE (median, mean)")
     print(f"  B  {pair}/corr.grd : {b}")
-    print(f"  A  intf/{sub}/corr.grd : {a if a else 'not found'}")
+    print(f"  A  intf/{a_dir or sub + ' (or reversed)'}/corr.grd : {a if a else 'not found'}")
     if b is None:
         sys.exit("B coherence grid missing: scroll back for a WARN from intf/filter")
 

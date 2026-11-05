@@ -18,9 +18,17 @@ only the network inversion, per-date filtering and screen export are new Python.
 - `utils/align_batch_nsr` now keeps each date's `r.grd`/`a.grd` in `SLC/offsets/` (previously deleted).
   **Existing stacks must rerun align_batch_nsr** to get them.
 - Tests: `bin_py/tests/test_iono_b_lib.py` (5 run, 1 skipped without netCDF4: the grid round-trip).
-- To verify on real data: that near range = `near_range + x·c/(2fs)` for both bands (B coherence over stable
-  ground after resampling is the check); B centre frequency/pixel size from `ab_params`; that the A grids'
-  y-rows map to the same azimuth lines for B.
+- `utils/check_B_registration NSR_<master>A NSR_<repeat>A` — one B-band interferogram (C `dem2topo_ra`, `intf`,
+  `filter`) with B vs A coherence. Weak test on its own (temporal decorrelation; low coherence is ambiguous).
+- **VERIFIED 2026-11-05 on the real stack (24 repeats, master 20260915):** `ab_params`: fA 1.2390, fB 1.2935 GHz,
+  dA 3.123 m, dB 24.983 m (ratio 8.0025), A/B PRF and first-line time identical on all 25 dates, near range
+  identical for A and B; three dates start 1 B pixel earlier (20260518, 20260623, 20260717). B offsets
+  −3.4 … +2.7 B px. Registration check = B-B amplitude `xcorr_py -noshift -xsearch 32 -ysearch 32 -nx 20
+  -ny 20` (master vs repeat, in SLC_B): range mean residual +0.01 / +0.05 / −0.08 / −0.04 px for 20260903 /
+  20260412 / 20260211 / 20260518 (offsets spanning the full range, one early-start date); azimuth MEDIAN 0.000
+  on all four, identical to the A-band result on the same pairs (azimuth means ±0.3 were outlier-driven).
+  **Pitfall:** run xcorr on resampled PRMs with `-noshift`: the resampled PRM keeps the old `rshift/ashift`
+  (e.g. ashift=182), which xcorr_py uses as the search seed and adds to its output.
 
 ## Changed 2026-10-20: NISAR resampling now uses upstream's C `resamp` (Doppler-aware azimuth sinc)
 
