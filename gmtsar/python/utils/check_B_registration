@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""check_B_registration -- does the stack-wise B registration work?
+
+Forms ONE Frequency-B interferogram (master vs one repeat) from SLC_B/ with the
+C tools (dem2topo_ra, intf, filter) and reports its coherence next to the
+A-band pair's, if intf/<pair>/corr.grd exists.  If B is registered, stable
+ground has high B coherence (typically a bit below A's because B is only 5 MHz
+-- more speckle averaging per pixel, so often similar or higher at equal ground
+resolution).  A registration error of about a pixel or more collapses it.
+
+Usage (case directory, after align_batch_nsr_B):
+    check_B_registration NSR_<master>A NSR_<repeat>A [filter_wavelength_m] [dec]
+
+Defaults: filter wavelength 500 m, dec 2.  Work dir: iono_B/ (topo_B/ for the
+B-geometry topo_ra.grd, reused if present; <ref_id>_<rep_id>/ for the pair).
+Needs topo/dem.grd.  Prints median/mean coherence via `gmt grdinfo -L2`.
+"""
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value
+
+
+def b_stem(a):
+    if not a.endswith("A"):
+        sys.exit(f"expected an A stem ending in 'A', got {a}")
+    return a[:-1] + "B"
+
+
+def corr_stats(path):
+    """(median, mean) of a grid via gmt grdinfo -L2, or None."""
+    if not os.path.isfile(path):
+        return None
+    out = subprocess.run(f"gmt grdinfo -L2 {path}", shell=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                         ).stdout.decode("utf-8", "replace")
+    med = re.search(r"median:\s*([-\d.eE+]+)", out)
+    mean = re.search(r"mean:\s*([-\d.eE+]+)", out)
+    return (float(med.group(1)) if med else None,
+            float(mean.group(1)) if mean else None)
+
+
+def main():
+    if len(sys.argv) not in (3, 4, 5):
+        sys.exit(__doc__)
+    a_ref, a_rep = sys.argv[1], sys.argv[2]
+    wl = sys.argv[3] if len(sys.argv) > 3 else "500"
+    dec = sys.argv[4] if len(sys.argv) > 4 else "2"
+    b_ref, b_rep = b_stem(a_ref), b_stem(a_rep)
+    root = os.getcwd()
+    for p in (f"SLC_B/{b_ref}.PRM", f"SLC_B/{b_rep}.SLC", "topo/dem.grd"):
+        if not os.path.isfile(p):
+            sys.exit(f"missing {p}")
+
+    os.makedirs("iono_B/topo_B", exist_ok=True)
+    os.chdir("iono_B/topo_B")
+    if not os.path.isfile("topo_ra.grd"):
+        run(f"cp -p ../../SLC_B/{b_ref}.PRM master.PRM")
+        run(f"ln -sf ../../raw/{b_ref}.LED .")
+        run("ln -sf ../../topo/dem.grd .")
+        run("dem2topo_ra master.PRM dem.grd")
+    if not os.path.isfile("topo_ra.grd"):
+        sys.exit("dem2topo_ra did not produce iono_B/topo_B/topo_ra.grd")
+    os.chdir(root)
+
+    ids = []
+    for s in (a_ref, a_rep):
+        ids.append(int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3))))
+    sub = f"{ids[0]}_{ids[1]}"
+    pair = f"iono_B/{sub}"
+    os.makedirs(pair, exist_ok=True)
+    os.chdir(pair)
+    for s in (b_ref, b_rep):
+        run(f"ln -sf ../../raw/{s}.LED .")
+        run(f"ln -sf ../../SLC_B/{s}.SLC .")
+        run(f"cp ../../SLC_B/{s}.PRM .")
+    run("ln -sf ../topo_B/topo_ra.grd .")
+    run(f"intf {b_ref}.PRM {b_rep}.PRM -topo topo_ra.grd")
+    run(f"filter {b_ref}.PRM {b_rep}.PRM {wl} {dec}")
+    os.chdir(root)
+
+    b = corr_stats(f"{pair}/corr.grd")
+    a = corr_stats(f"intf/{sub}/corr.grd")
+    print("\nCOHERENCE (median, mean)")
+    print(f"  B  {pair}/corr.grd : {b}")
+    print(f"  A  intf/{sub}/corr.grd : {a if a else 'not found'}")
+    if b is None:
+        sys.exit("B coherence grid missing: scroll back for a WARN from intf/filter")
+
+
+if __name__ == "__main__":
+    main()
