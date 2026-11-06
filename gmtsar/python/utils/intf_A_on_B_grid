@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""intf_A_on_B_grid -- Stage 2, step 1b: re-multilook the A-band interferograms
+onto the B-band grid, WITHOUT re-forming them.
+
+Why: B's range pixel is 8x A's (25 m vs 3.1 m) and `intf_batch_B` could only
+reach A's existing cell size when it is a whole number of B pixels.  When A's
+cells are finer (e.g. 12.5 m vs B's 25 m), the dispersive difference needs both
+bands on the same grid, so A is re-filtered to B's grid from the full-resolution
+complex interferogram already in intf/<pair>/ (real.grd, imag.grd) with the C
+`filter` -- one multilook of the complex data, not an interpolation of phase.
+
+Usage (case directory, after intf_batch and intf_batch_B):
+    intf_A_on_B_grid intf.in batch.config
+
+Output: iono_A/<ref_id>_<rep_id>/{phase,corr,amp1,amp2,realfilt,imagfilt,...}.grd
+Resumable (skips pairs with iono_A/<pair>/phase.grd).
+
+NOTE: use phase.grd / realfilt+imagfilt from these dirs for estimation, NOT
+phasefilt.grd (Goldstein, an adaptive nonlinear filter: it distorts the very
+long-wavelength phase and changes it differently in A and B).
+"""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value
+from iono_b_lib import slc_params
+
+
+def _cfg(path, key, default=""):
+    with open(path) as f:
+        for ln in f:
+            p = ln.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def grd_info(path):
+    """(x_inc, y_inc, nx, ny) via gmt grdinfo -C."""
+    o = subprocess.run(f"gmt grdinfo -C {path}", shell=True, stdout=subprocess.PIPE
+                       ).stdout.decode().split()
+    return float(o[7]), float(o[8]), int(o[9]), int(o[10])
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    intf_in, config = sys.argv[1], sys.argv[2]
+    master = _cfg(config, "master_image")
+    wl = _cfg(config, "iono_B_filter_wavelength") or _cfg(config, "filter_wavelength", "200")
+    if not master:
+        sys.exit("master_image not set in config")
+    with open(intf_in) as f:
+        pairs = [ln.strip().split(":", 1) for ln in f if ":" in ln]
+
+    def pid(s):
+        return int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3)))
+
+    d_a = slc_params(f"SLC/{master}.PRM")["dr"]
+    d_b = slc_params(f"SLC_B/{master[:-1]}B.PRM")["dr"]
+
+    subs = [f"{pid(r)}_{pid(p)}" for r, p in pairs]
+    ref_b = next((f"iono_B/{s}/phasefilt.grd" for s in subs
+                  if os.path.isfile(f"iono_B/{s}/phasefilt.grd")), None)
+    if ref_b is None:
+        sys.exit("no iono_B/<pair>/phasefilt.grd found: run intf_batch_B first")
+    bx, by, bnx, bny = grd_info(ref_b)
+    rng_dec = bx * d_b / d_a
+    if abs(rng_dec - round(rng_dec)) > 0.02 * rng_dec:
+        sys.exit(f"B range step is {rng_dec:.3f} A pixels: not an integer, cannot match")
+    rng_dec = int(round(rng_dec))
+    azi_dec = int(round(by))
+    print(f"B grid: {bx:g} B px = {bx * d_b:.1f} m range, {by:g} lines azimuth, {bnx} x {bny}")
+    print(f"A filter call: range_dec={rng_dec} A px ({rng_dec * d_a:.1f} m), "
+          f"azimuth_dec={azi_dec}, filter wavelength {wl} m")
+
+    os.makedirs("iono_A", exist_ok=True)
+    failed = []
+    for i, ((ref, rep), sub) in enumerate(zip(pairs, subs), 1):
+        if os.path.isfile(f"iono_A/{sub}/phase.grd"):
+            print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            continue
+        src = f"intf/{sub}"
+        miss = [f for f in ("real.grd", "imag.grd", f"{ref}.PRM", f"{rep}.PRM")
+                if not os.path.isfile(f"{src}/{f}")]
+        if miss:
+            sys.exit(f"{src}: missing {miss}: the full-resolution complex interferogram "
+                     f"(intf output) is needed")
+        print(f"[{i}/{len(pairs)}] {sub}")
+        d = f"iono_A/{sub}"
+        os.makedirs(d, exist_ok=True)
+        cwd = os.getcwd()
+        os.chdir(d)
+        for f in ("real.grd", "imag.grd"):
+            run(f"ln -sf ../../{src}/{f} .")
+        for s in (ref, rep):
+            run(f"cp ../../{src}/{s}.PRM .")
+            run(f"ln -sf ../../SLC/{s}.SLC .")
+            run(f"ln -sf ../../raw/{s}.LED .")
+        run(f"filter {ref}.PRM {rep}.PRM {wl} 1 {rng_dec} {azi_dec}")
+        ok = all(os.path.isfile(f) for f in ("phase.grd", "corr.grd", "realfilt.grd"))
+        if ok:
+            ax, ay, anx, any_ = grd_info("phase.grd")
+            bx2, by2, bnx2, bny2 = grd_info(f"../../iono_B/{sub}/phase.grd")
+            if (anx, any_) != (bnx2, bny2):
+                print(f"WARNING {sub}: grid sizes differ A {anx}x{any_} vs B {bnx2}x{bny2}")
+        os.chdir(cwd)
+        if not ok:
+            failed.append(sub)
+            print(f"FAILED {sub}")
+    if failed:
+        sys.exit(f"{len(failed)} pair(s) failed: {failed}")
+    print("\nall pairs done; A and B phase.grd now share a grid step "
+          "(check for 'grid sizes differ' warnings above)")
+
+
+if __name__ == "__main__":
+    main()
