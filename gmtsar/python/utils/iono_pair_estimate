@@ -52,9 +52,9 @@ def azimuth_pixel_m(prm):
     return vel / np.sqrt(1.0 + ht / re_) / prf
 
 
-def unwrap_A(pair_dir, thr, defomax, interp):
+def unwrap_A(pair_dir, thr, defomax, interp, tag=""):
     """Run snaphu.py on A's multilooked phase; returns path of unwrap.grd."""
-    unw = os.path.join(pair_dir, "unw")
+    unw = os.path.join(pair_dir, "unw" + (f"_{tag}" if tag else ""))
     os.makedirs(unw, exist_ok=True)
     cwd = os.getcwd()
     os.chdir(unw)
@@ -79,13 +79,20 @@ def main():
     ap.add_argument("--coh-min", type=float, default=0.2)
     ap.add_argument("--incidence-deg", type=float, default=40.0)
     ap.add_argument("--n-eff", type=float, default=None)
+    ap.add_argument("--interp", choices=("0", "1"), default=None,
+                    help="1 = fill gaps (nearest neighbour, then mask back) before "
+                         "unwrapping via snaphu.py; default: near_interp from the config")
+    ap.add_argument("--tag", default="",
+                    help="label for a variant run: writes iono_est_<tag>/ and "
+                         "iono_A/<pair>/unw_<tag>/ so variants on the same list don't collide")
     ap.add_argument("--preview", action="store_true")
     a = ap.parse_args()
 
     master = _cfg(a.config, "master_image")
     thr = _cfg(a.config, "threshold_snaphu", "0.1")
     defomax = _cfg(a.config, "defomax", "0")
-    interp = "1" if _cfg(a.config, "near_interp", "0") == "1" else "0"
+    interp = a.interp or ("1" if _cfg(a.config, "near_interp", "0") == "1" else "0")
+    print(f"snaphu: threshold {thr}, defomax {defomax}, interp {interp}")
     wl = float(_cfg(a.config, "iono_B_filter_wavelength") or _cfg(a.config, "filter_wavelength", "200"))
     with open(a.intf_in) as f:
         pairs = [ln.strip().split(":", 1) for ln in f if ":" in ln]
@@ -105,7 +112,7 @@ def main():
 
     for i, (ref, rep) in enumerate(pairs, 1):
         sub = f"{pid(ref)}_{pid(rep)}"
-        out = f"iono_est/{sub}"
+        out = f"iono_est{'_' + a.tag if a.tag else ''}/{sub}"
         if os.path.isfile(f"{out}/I.grd"):
             print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
             continue
@@ -115,7 +122,7 @@ def main():
         if miss:
             sys.exit(f"missing {miss}")
         print(f"[{i}/{len(pairs)}] {sub}: unwrapping A")
-        unw_path = unwrap_A(f"iono_A/{sub}", thr, defomax, interp)
+        unw_path = unwrap_A(f"iono_A/{sub}", thr, defomax, interp, a.tag)
 
         phi_a, x, y, info = read_gmt_grd(unw_path)
         coh_a = read_gmt_grd(f"iono_A/{sub}/corr.grd")[0]
