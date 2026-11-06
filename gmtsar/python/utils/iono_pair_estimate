@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""iono_pair_estimate -- Stage 2, step 2: raw per-pair dispersive (ionosphere)
+estimate from the A and B interferograms on the common B grid.
+
+Usage (case directory, after intf_batch_B and intf_A_on_B_grid):
+    iono_pair_estimate intf.in batch.config [--coh-min 0.2] [--incidence-deg 40]
+                       [--n-eff N] [--preview]
+
+For each pair (resumable; skips pairs with iono_est/<pair>/I.grd):
+  1. unwrap A's multilooked phase (iono_A/<pair>/phase.grd) with the existing
+     snaphu.py, in iono_A/<pair>/unw/ (phase.grd is linked there as
+     phasefilt.grd -- snaphu.py's fixed input name -- so the plain multilook,
+     not the Goldstein output, is unwrapped);
+  2. I = -wrap(phi_B - r*phi_A_unw) * r/(r^2-1)   (iono_est_lib), with a
+     Cramer-Rao sigma from both coherences and N_eff, and a validity mask;
+  3. write iono_est/<pair>/{I,sigma,psi}.grd (NaN where invalid) and print
+     QC numbers.  --preview also writes preview.png (needs matplotlib).
+
+No spatial filtering here (raw estimates for the network inversion).
+snaphu settings come from the config (threshold_snaphu, defomax, near_interp).
+N_eff is an approximation (iono_est_lib.n_eff_gaussian; override with --n-eff);
+the incidence angle is only used to turn B's slant-range pixel into ground range.
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value
+from iono_b_lib import slc_params
+from iono_est_lib import (band_ratio, dispersive_estimate, n_eff_gaussian)
+from gmt_grd_io import read_gmt_grd, write_gmt_grd
+
+
+def _cfg(path, key, default=""):
+    with open(path) as f:
+        for ln in f:
+            p = ln.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def azimuth_pixel_m(prm):
+    from geom_align_lib import read_prm_value
+    vel = float(read_prm_value(prm, "SC_vel"))
+    ht = float(read_prm_value(prm, "SC_height"))
+    re_ = float(read_prm_value(prm, "earth_radius"))
+    prf = float(read_prm_value(prm, "PRF"))
+    return vel / np.sqrt(1.0 + ht / re_) / prf
+
+
+def unwrap_A(pair_dir, thr, defomax, interp):
+    """Run snaphu.py on A's multilooked phase; returns path of unwrap.grd."""
+    unw = os.path.join(pair_dir, "unw")
+    os.makedirs(unw, exist_ok=True)
+    cwd = os.getcwd()
+    os.chdir(unw)
+    if not os.path.isfile("unwrap.grd"):
+        run("ln -sf ../phase.grd phasefilt.grd")
+        run("ln -sf ../corr.grd corr.grd")
+        ph, x, y, info = read_gmt_grd("phasefilt.grd")
+        mask = np.where(np.isfinite(ph), 1.0, np.nan).astype(np.float32)
+        write_gmt_grd("mask.grd", mask, x, y, node_offset=info["node_offset"])
+        run(f"snaphu.py {thr} {defomax} {interp}")
+    ok = os.path.isfile("unwrap.grd")
+    os.chdir(cwd)
+    if not ok:
+        sys.exit(f"{pair_dir}: snaphu.py produced no unwrap.grd (scroll back for a WARN)")
+    return os.path.join(unw, "unwrap.grd")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("intf_in")
+    ap.add_argument("config")
+    ap.add_argument("--coh-min", type=float, default=0.2)
+    ap.add_argument("--incidence-deg", type=float, default=40.0)
+    ap.add_argument("--n-eff", type=float, default=None)
+    ap.add_argument("--preview", action="store_true")
+    a = ap.parse_args()
+
+    master = _cfg(a.config, "master_image")
+    thr = _cfg(a.config, "threshold_snaphu", "0.1")
+    defomax = _cfg(a.config, "defomax", "0")
+    interp = "1" if _cfg(a.config, "near_interp", "0") == "1" else "0"
+    wl = float(_cfg(a.config, "iono_B_filter_wavelength") or _cfg(a.config, "filter_wavelength", "200"))
+    with open(a.intf_in) as f:
+        pairs = [ln.strip().split(":", 1) for ln in f if ":" in ln]
+
+    pa = slc_params(f"SLC/{master}.PRM")
+    pb = slc_params(f"SLC_B/{master[:-1]}B.PRM")
+    r, _, _ = band_ratio(pa["freq"], pb["freq"])
+    az_m = azimuth_pixel_m(f"SLC/{master}.PRM")
+    rng_ground = pb["dr"] / np.sin(np.radians(a.incidence_deg))
+    n_eff = a.n_eff or n_eff_gaussian(wl, az_m, rng_ground)
+    print(f"fA {pa['freq'] / 1e9:.4f} GHz, fB {pb['freq'] / 1e9:.4f} GHz, r = {r:.5f}")
+    print(f"N_eff per cell ~ {n_eff:.0f} (wavelength {wl:g} m, az px {az_m:.2f} m, "
+          f"ground range px {rng_ground:.1f} m)  [approximate]; coh_min {a.coh_min}")
+
+    def pid(s):
+        return int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3)))
+
+    for i, (ref, rep) in enumerate(pairs, 1):
+        sub = f"{pid(ref)}_{pid(rep)}"
+        out = f"iono_est/{sub}"
+        if os.path.isfile(f"{out}/I.grd"):
+            print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            continue
+        need = [f"iono_A/{sub}/phase.grd", f"iono_A/{sub}/corr.grd",
+                f"iono_B/{sub}/phase.grd", f"iono_B/{sub}/corr.grd"]
+        miss = [p for p in need if not os.path.isfile(p)]
+        if miss:
+            sys.exit(f"missing {miss}")
+        print(f"[{i}/{len(pairs)}] {sub}: unwrapping A")
+        unw_path = unwrap_A(f"iono_A/{sub}", thr, defomax, interp)
+
+        phi_a, x, y, info = read_gmt_grd(unw_path)
+        coh_a = read_gmt_grd(f"iono_A/{sub}/corr.grd")[0]
+        phi_b = read_gmt_grd(f"iono_B/{sub}/phase.grd")[0]
+        coh_b = read_gmt_grd(f"iono_B/{sub}/corr.grd")[0]
+        shapes = {phi_a.shape, coh_a.shape, phi_b.shape, coh_b.shape}
+        if len(shapes) != 1:
+            sys.exit(f"{sub}: grid shapes differ: {shapes}")
+        res = dispersive_estimate(phi_a, phi_b, coh_a, coh_b, r, n_eff, coh_min=a.coh_min)
+
+        os.makedirs(out, exist_ok=True)
+        for name in ("I", "sigma", "psi"):
+            write_gmt_grd(f"{out}/{name}.grd", res[name].astype(np.float32), x, y,
+                          node_offset=info["node_offset"],
+                          title=f"raw dispersive estimate {name}",
+                          description="iono_pair_estimate; rad, NaN where invalid")
+
+        v = res["valid"]
+        I, s, psi = res["I"][v], res["sigma"][v], res["psi"][v]
+        print(f"   valid cells {v.mean() * 100:.1f} %  |  I: median {np.median(I):.2f}, "
+              f"5-95 % [{np.percentile(I, 5):.2f}, {np.percentile(I, 95):.2f}] rad  |  "
+              f"per-cell sigma_I median {np.median(s):.2f} rad  |  "
+              f"|psi| > 1 rad in {np.mean(np.abs(psi) > 1.0) * 100:.1f} % of valid cells")
+        # first-look noise check: cell-to-cell scatter of I in x versus predicted sigma
+        d = np.diff(res["I"], axis=1)
+        d = d[np.isfinite(d)]
+        if d.size:
+            print(f"   cell-to-cell scatter of I (MAD-based sigma/sqrt2): "
+                  f"{1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2):.2f} rad "
+                  f"(compare predicted sigma_I {np.median(s):.2f})")
+        if a.preview:
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                st = max(1, res["I"].shape[0] // 700)
+                fig, ax = plt.subplots(1, 3, figsize=(15, 6))
+                for axx, (nm, arr, vmin, vmax) in zip(ax, (
+                        ("I (rad)", res["I"], np.nanpercentile(I, 2), np.nanpercentile(I, 98)),
+                        ("sigma_I (rad)", res["sigma"], 0, np.nanpercentile(s, 98)),
+                        ("coh_B", coh_b, 0, 1))):
+                    im = axx.imshow(arr[::st, ::st], vmin=vmin, vmax=vmax, aspect="auto")
+                    axx.set_title(f"{sub}  {nm}")
+                    plt.colorbar(im, ax=axx)
+                fig.savefig(f"{out}/preview.png", dpi=90)
+                plt.close(fig)
+            except Exception as e:  # preview is optional
+                print(f"   (preview skipped: {e})")
+    print("\ndone: iono_est/<pair>/{I,sigma,psi}.grd")
+
+
+if __name__ == "__main__":
+    main()
