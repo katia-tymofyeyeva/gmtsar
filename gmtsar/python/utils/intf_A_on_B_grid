@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""intf_A_on_B_grid -- Stage 2, step 1b: re-multilook the A-band interferograms
-onto the B-band grid, WITHOUT re-forming them.
+"""intf_A_on_B_grid -- Stage 2, step 1b: put the A-band interferograms on the
+B-band grid, from products `filter` already made (no new intf/filter run).
 
-Why: B's range pixel is 8x A's (25 m vs 3.1 m) and `intf_batch_B` could only
-reach A's existing cell size when it is a whole number of B pixels.  When A's
-cells are finer (e.g. 12.5 m vs B's 25 m), the dispersive difference needs both
-bands on the same grid, so A is re-filtered to B's grid from the full-resolution
-complex interferogram already in intf/<pair>/ (real.grd, imag.grd) with the C
-`filter` -- one multilook of the complex data, not an interpolation of phase.
+B's range cell is 25 m; A's existing cells are finer (e.g. 12.5 m).  `filter`
+keeps realfilt.grd, imagfilt.grd, amp1.grd, amp2.grd (it deletes only the
+full-resolution real/imag).  A's Gaussian (sigma = wavelength/5.3, ~38 m for
+200 m) oversamples them, so averaging `factor` neighbouring cells in the
+complex domain loses nothing and is centred exactly on B's cells (shared pixel
+0; verified A/B near range identical).  Same coherence formula as `filter`.
 
 Usage (case directory, after intf_batch and intf_batch_B):
     intf_A_on_B_grid intf.in batch.config
 
-Output: iono_A/<ref_id>_<rep_id>/{phase,corr,amp1,amp2,realfilt,imagfilt,...}.grd
-Resumable (skips pairs with iono_A/<pair>/phase.grd).
+Output: iono_A/<ref_id>_<rep_id>/{phase,corr}.grd on B's grid (same header and
+row order as iono_B/<pair>/phase.grd and corr.grd).  Resumable.  Needs netCDF4
+(gmt_grd_io); ~1.5 GB RAM per pair at NISAR size.
 
-NOTE: use phase.grd / realfilt+imagfilt from these dirs for estimation, NOT
-phasefilt.grd (Goldstein, an adaptive nonlinear filter: it distorts the very
-long-wavelength phase and changes it differently in A and B).
+Use these (plain multilooks), never phasefilt.grd (Goldstein), for estimation.
 """
 import os
 import subprocess
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import run, grep_value
+from gmtsar_lib import grep_value
 from iono_b_lib import slc_params
+from iono_est_lib import complex_on_coarse_grid
+from gmt_grd_io import read_gmt_grd, write_gmt_grd
 
 
 def _cfg(path, key, default=""):
@@ -49,7 +52,6 @@ def main():
         sys.exit(__doc__)
     intf_in, config = sys.argv[1], sys.argv[2]
     master = _cfg(config, "master_image")
-    wl = _cfg(config, "iono_B_filter_wavelength") or _cfg(config, "filter_wavelength", "200")
     if not master:
         sys.exit("master_image not set in config")
     with open(intf_in) as f:
@@ -60,60 +62,48 @@ def main():
 
     d_a = slc_params(f"SLC/{master}.PRM")["dr"]
     d_b = slc_params(f"SLC_B/{master[:-1]}B.PRM")["dr"]
-
     subs = [f"{pid(r)}_{pid(p)}" for r, p in pairs]
-    ref_b = next((f"iono_B/{s}/phasefilt.grd" for s in subs
-                  if os.path.isfile(f"iono_B/{s}/phasefilt.grd")), None)
-    if ref_b is None:
-        sys.exit("no iono_B/<pair>/phasefilt.grd found: run intf_batch_B first")
-    bx, by, bnx, bny = grd_info(ref_b)
-    rng_dec = bx * d_b / d_a
-    if abs(rng_dec - round(rng_dec)) > 0.02 * rng_dec:
-        sys.exit(f"B range step is {rng_dec:.3f} A pixels: not an integer, cannot match")
-    rng_dec = int(round(rng_dec))
-    azi_dec = int(round(by))
-    print(f"B grid: {bx:g} B px = {bx * d_b:.1f} m range, {by:g} lines azimuth, {bnx} x {bny}")
-    print(f"A filter call: range_dec={rng_dec} A px ({rng_dec * d_a:.1f} m), "
-          f"azimuth_dec={azi_dec}, filter wavelength {wl} m")
+    print(f"{len(pairs)} pairs")
 
     os.makedirs("iono_A", exist_ok=True)
-    failed = []
     for i, ((ref, rep), sub) in enumerate(zip(pairs, subs), 1):
-        if os.path.isfile(f"iono_A/{sub}/phase.grd"):
+        out = f"iono_A/{sub}"
+        if os.path.isfile(f"{out}/phase.grd") and os.path.isfile(f"{out}/corr.grd"):
             print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
             continue
-        src = f"intf/{sub}"
-        miss = [f for f in ("real.grd", "imag.grd", f"{ref}.PRM", f"{rep}.PRM")
-                if not os.path.isfile(f"{src}/{f}")]
+        src, bdir = f"intf/{sub}", f"iono_B/{sub}"
+        need = [f"{src}/{f}" for f in ("realfilt.grd", "imagfilt.grd", "amp1.grd", "amp2.grd")]
+        need += [f"{bdir}/phase.grd", f"{bdir}/corr.grd"]
+        miss = [p for p in need if not os.path.isfile(p)]
         if miss:
-            sys.exit(f"{src}: missing {miss}: the full-resolution complex interferogram "
-                     f"(intf output) is needed")
-        print(f"[{i}/{len(pairs)}] {sub}")
-        d = f"iono_A/{sub}"
-        os.makedirs(d, exist_ok=True)
-        cwd = os.getcwd()
-        os.chdir(d)
-        for f in ("real.grd", "imag.grd"):
-            run(f"ln -sf ../../{src}/{f} .")
-        for s in (ref, rep):
-            run(f"cp ../../{src}/{s}.PRM .")
-            run(f"ln -sf ../../SLC/{s}.SLC .")
-            run(f"ln -sf ../../raw/{s}.LED .")
-        run(f"filter {ref}.PRM {rep}.PRM {wl} 1 {rng_dec} {azi_dec}")
-        ok = all(os.path.isfile(f) for f in ("phase.grd", "corr.grd", "realfilt.grd"))
-        if ok:
-            ax, ay, anx, any_ = grd_info("phase.grd")
-            bx2, by2, bnx2, bny2 = grd_info(f"../../iono_B/{sub}/phase.grd")
-            if (anx, any_) != (bnx2, bny2):
-                print(f"WARNING {sub}: grid sizes differ A {anx}x{any_} vs B {bnx2}x{bny2}")
-        os.chdir(cwd)
-        if not ok:
-            failed.append(sub)
-            print(f"FAILED {sub}")
-    if failed:
-        sys.exit(f"{len(failed)} pair(s) failed: {failed}")
-    print("\nall pairs done; A and B phase.grd now share a grid step "
-          "(check for 'grid sizes differ' warnings above)")
+            sys.exit(f"missing {miss}: needs intf_batch (A) and intf_batch_B outputs")
+        ax, ay, anx, any_ = grd_info(f"{src}/realfilt.grd")
+        bx, by, bnx, bny = grd_info(f"{bdir}/phase.grd")
+        factor = bx * d_b / d_a / ax
+        if abs(factor - round(factor)) > 0.02 * factor or round(factor) < 1:
+            sys.exit(f"{sub}: B/A range step ratio {factor:.3f} is not an integer")
+        factor = int(round(factor))
+        if abs(ay - by) > 1e-6 or any_ != bny:
+            sys.exit(f"{sub}: azimuth grids differ: A {ay:g} x {any_}, B {by:g} x {bny}")
+        print(f"[{i}/{len(pairs)}] {sub}: A {anx}x{any_} (step {ax:g}) -> B {bnx}x{bny}, factor {factor}")
+
+        re, _, _, _ = read_gmt_grd(f"{src}/realfilt.grd")
+        im, _, _, _ = read_gmt_grd(f"{src}/imagfilt.grd")
+        a1, _, _, _ = read_gmt_grd(f"{src}/amp1.grd")
+        a2, _, _, _ = read_gmt_grd(f"{src}/amp2.grd")
+        phase, coh = complex_on_coarse_grid(re, im, a1, a2, factor, bnx)
+        del re, im, a1, a2
+        # same row flip filter applies to phase.grd / corr.grd
+        phase, coh = np.flipud(phase), np.flipud(coh)
+        _, x, y, info = read_gmt_grd(f"{bdir}/phase.grd")
+        if phase.shape != (len(y), len(x)):
+            sys.exit(f"{sub}: coarsened shape {phase.shape} != B grid {(len(y), len(x))}")
+        os.makedirs(out, exist_ok=True)
+        for name, arr in (("phase", phase), ("corr", coh)):
+            write_gmt_grd(f"{out}/{name}.grd", arr, x, y, node_offset=info["node_offset"],
+                          title=f"A-band {name} on the B grid",
+                          description="intf_A_on_B_grid: complex mean of filter's realfilt/imagfilt")
+    print("\ndone: iono_A/<pair>/{phase,corr}.grd share the grid of iono_B/<pair>/")
 
 
 if __name__ == "__main__":

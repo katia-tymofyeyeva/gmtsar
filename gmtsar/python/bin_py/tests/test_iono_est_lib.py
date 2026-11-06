@@ -23,6 +23,40 @@ def screen(n=120):
     return 4.0 * np.sin(2 * np.pi * x * 0.8) * np.cos(2 * np.pi * y * 0.6) + 2.0 * x - 1.0 * y
 
 
+class TestCoarsen(unittest.TestCase):
+    def test_columns_and_centering(self):
+        a = np.arange(12, dtype=float).reshape(2, 6)
+        c = ie.coarsen_range(a, 2, 3)
+        self.assertEqual(c.shape, (2, 3))
+        self.assertTrue(np.allclose(c[0], [0.5, 2.5, 4.5]))    # pairs (0,1),(2,3),(4,5)
+        c = ie.coarsen_range(np.arange(14, dtype=float).reshape(2, 7), 2, 3)   # extra column dropped
+        self.assertEqual(c.shape, (2, 3))
+        with self.assertRaises(ValueError):
+            ie.coarsen_range(a, 2, 4)
+
+    def test_phase_and_coherence(self):
+        # fully coherent smooth field: coarsened phase = field at cell centres, coherence 1
+        ny, nx, f = 4, 40, 2
+        x = np.arange(nx)
+        ph = 0.05 * x[None, :] + np.zeros((ny, 1))
+        amp = np.full((ny, nx), 3.0)
+        re, im = amp * np.cos(ph), amp * np.sin(ph)
+        p, c = ie.complex_on_coarse_grid(re, im, amp, amp, f, nx // f)
+        centre = 0.05 * (np.arange(nx // f) * f + 0.5)
+        self.assertLess(np.abs(p[0] - centre).max(), 1e-3)
+        self.assertTrue(np.all(c > 0.99) and np.all(c <= 1.0))
+
+    def test_incoherent_and_empty(self):
+        rng = np.random.default_rng(0)
+        re, im = rng.normal(size=(50, 400)), rng.normal(size=(50, 400))
+        amp = np.ones((50, 400))
+        _, c = ie.complex_on_coarse_grid(re, im, amp * 2, amp * 2, 2, 200)
+        self.assertLess(np.nanmean(c), 0.5)
+        z = np.zeros((2, 4))
+        p, c = ie.complex_on_coarse_grid(z, z, z, z, 2, 2)
+        self.assertTrue(np.isnan(p).all() and np.isnan(c).all())
+
+
 class TestRatio(unittest.TestCase):
     def test_gains(self):
         r, a, b = ie.band_ratio(1.239, 1.2935)

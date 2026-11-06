@@ -20,6 +20,42 @@ Goldstein `phasefilt.grd`.
 import numpy as np
 
 
+def coarsen_range(a, factor, ncols):
+    """Average `factor` neighbouring columns of a 2-D array (NaN counted as 0),
+    keeping the first `ncols` coarse columns.  For a cell grid that starts at
+    the same pixel in both products (here A and B share pixel 0), cell j of
+    the result is centred exactly where cell j of a `factor`-times coarser grid
+    would be (A cells 8j+2 and 8j+6 A-px average to 8j+4)."""
+    a = np.nan_to_num(np.asarray(a, dtype=np.float32))
+    ny, nx = a.shape
+    need = ncols * factor
+    if nx < need:
+        raise ValueError(f"need {need} columns for {ncols} coarse cells, have {nx}")
+    return a[:, :need].reshape(ny, ncols, factor).mean(axis=2, dtype=np.float32)
+
+
+def complex_on_coarse_grid(real, imag, amp1, amp2, factor, ncols):
+    """Phase and coherence of an already-multilooked complex interferogram
+    coarsened by `factor` in range, from `filter`'s own outputs.
+
+    Same formula `filter` uses for coherence, amp / sqrt(amp1*amp2), with
+    amp = hypot(real, imag); real/imag/amp1/amp2 are averaged over the cells
+    being merged.  Returns (phase, coh), phase in (-pi, pi]; cells with no
+    signal are NaN.  Row order is whatever the inputs have (the caller applies
+    the same FLIPUD `filter` applies to phase.grd/corr.grd)."""
+    re = coarsen_range(real, factor, ncols)
+    im = coarsen_range(imag, factor, ncols)
+    p1 = coarsen_range(amp1, factor, ncols)
+    p2 = coarsen_range(amp2, factor, ncols)
+    amp = np.hypot(re, im)
+    den = np.sqrt(p1 * p2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coh = np.where(den > 0, amp / den, np.nan)
+        phase = np.where(amp > 0, np.arctan2(im, re), np.nan)
+    coh = np.where(np.isfinite(coh), np.clip(coh, 0.0, 1.0), np.nan)
+    return phase.astype(np.float32), coh.astype(np.float32)
+
+
 def band_ratio(f_a, f_b):
     """(r, a, b) with I = a*phi_A + b*phi_B (a = r^2/(r^2-1), b = -r/(r^2-1))."""
     r = f_b / f_a
