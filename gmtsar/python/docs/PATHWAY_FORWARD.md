@@ -27,7 +27,19 @@ only the network inversion, per-date filtering and screen export are new Python.
   -ny 20` (master vs repeat, in SLC_B): range mean residual +0.01 / +0.05 / −0.08 / −0.04 px for 20260903 /
   20260412 / 20260211 / 20260518 (offsets spanning the full range, one early-start date); azimuth MEDIAN 0.000
   on all four, identical to the A-band result on the same pairs (azimuth means ±0.3 were outlier-driven).
-  **Pitfall:** run xcorr on resampled PRMs with `-noshift`: the resampled PRM keeps the old `rshift/ashift`
+- **Stage 2 step 1 (2026-11-05):** `utils/intf_batch_B intf.in config` forms B pair interferograms
+  (C `dem2topo_ra`/`intf`/`filter`, explicit decimation matched to A's `phasefilt.grd` steps) into
+  `iono_B/<pair>/`; `utils/intf_A_on_B_grid` re-multilooks A's full-res complex interferogram
+  (`intf/<pair>/real.grd,imag.grd`) onto B's grid into `iono_A/<pair>/` (needed because A's cells are 12.5 m vs
+  B's 25 m in range; B cannot go finer). Real run on 3 pairs: all rc=0, ~4 min/pair, B grid 6656x6650
+  (25 m x 8 lines); mean coherence B vs A: 0.376/0.365, 0.394/0.360, 0.275/0.253 (B >= A: registration and
+  B topo fine). `filter` accepted the float azimuth step (`conv 2.0 1.0`). Use `phase.grd`/`realfilt`+`imagfilt`
+  for estimation, NEVER `phasefilt.grd` (Goldstein). `gmt grdinfo -L2` has no median (use `-L1`).
+- `utils/iono_est_lib.py`: raw dispersive estimate `I = -wrap(phi_B - r*phi_A_unw) * r/(r^2-1)`, r = fB/fA.
+  Only A needs unwrapping (psi is ~9 % of I); a 2*pi slip in A shifts I by 2*pi*r/(r+1) ~= 3.2 rad.
+  CRLB variance from coherence and N_eff (`n_eff_gaussian` is an approximation). Tests:
+  `bin_py/tests/test_iono_est_lib.py` (7, synthetic).
+- **Pitfall:** run xcorr on resampled PRMs with `-noshift`: the resampled PRM keeps the old `rshift/ashift`
   (e.g. ashift=182), which xcorr_py uses as the search seed and adds to its output.
 
 ## Changed 2026-10-20: NISAR resampling now uses upstream's C `resamp` (Doppler-aware azimuth sinc)

@@ -34,11 +34,13 @@ def corr_stats(path):
     """(median, mean) of a grid via gmt grdinfo -L2, or None."""
     if not os.path.isfile(path):
         return None
-    out = subprocess.run(f"gmt grdinfo -L2 {path}", shell=True,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                         ).stdout.decode("utf-8", "replace")
-    med = re.search(r"median:\s*([-\d.eE+]+)", out)
-    mean = re.search(r"mean:\s*([-\d.eE+]+)", out)
+    # -L1 gives the median, -L2 the mean/stdev/rms: separate calls
+    def info(opt):
+        return subprocess.run(f"gmt grdinfo {opt} {path}", shell=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                              ).stdout.decode("utf-8", "replace")
+    med = re.search(r"median:\s*([-\d.eE+]+)", info("-L1"))
+    mean = re.search(r"mean:\s*([-\d.eE+]+)", info("-L2"))
     return (float(med.group(1)) if med else None,
             float(mean.group(1)) if mean else None)
 
