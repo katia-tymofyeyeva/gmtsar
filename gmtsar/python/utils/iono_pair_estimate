@@ -30,7 +30,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gmtsar_lib import run, grep_value
 from iono_b_lib import slc_params
-from iono_est_lib import (band_ratio, dispersive_estimate, n_eff_gaussian)
+from iono_est_lib import (band_ratio, dispersive_estimate, n_eff_gaussian,
+                          block_mean_phasor, unwrap_via_coarse, unwrap_from_reference)
 from gmt_grd_io import read_gmt_grd, write_gmt_grd
 
 
@@ -52,24 +53,55 @@ def azimuth_pixel_m(prm):
     return vel / np.sqrt(1.0 + ht / re_) / prf
 
 
-def unwrap_A(pair_dir, thr, defomax, interp, tag=""):
-    """Run snaphu.py on A's multilooked phase; returns path of unwrap.grd."""
+def unwrap_A(pair_dir, thr, defomax, interp, tag="", block=0):
+    """Unwrapped A phase (full grid, float32) and the grid it lives on.
+
+    block = 0 (default): unwrap the full-resolution multilook directly with
+    snaphu.py.  block > 0 (EXPERIMENTAL, accuracy untested on real data):
+    block-average the phase block x block (coherence-weighted complex mean),
+    unwrap that, interpolate the coarse surface back and add the wrapped
+    residual (iono_est_lib.unwrap_via_coarse).
+    Returns (phi_a_unw, x, y, info)."""
     unw = os.path.join(pair_dir, "unw" + (f"_{tag}" if tag else ""))
     os.makedirs(unw, exist_ok=True)
+    phase, x, y, info = read_gmt_grd(os.path.join(pair_dir, "phase.grd"))
+    corr = read_gmt_grd(os.path.join(pair_dir, "corr.grd"))[0]
     cwd = os.getcwd()
     os.chdir(unw)
-    if not os.path.isfile("unwrap.grd"):
-        run("ln -sf ../phase.grd phasefilt.grd")
-        run("ln -sf ../corr.grd corr.grd")
-        ph, x, y, info = read_gmt_grd("phasefilt.grd")
-        mask = np.where(np.isfinite(ph), 1.0, np.nan).astype(np.float32)
-        write_gmt_grd("mask.grd", mask, x, y, node_offset=info["node_offset"])
-        run(f"snaphu.py {thr} {defomax} {interp}")
-    ok = os.path.isfile("unwrap.grd")
-    os.chdir(cwd)
-    if not ok:
-        sys.exit(f"{pair_dir}: snaphu.py produced no unwrap.grd (scroll back for a WARN)")
-    return os.path.join(unw, "unwrap.grd")
+    try:
+        if block > 0:
+            pc, cc, nr, nc = block_mean_phasor(phase, corr, block)
+            xc = x[:nc * block].reshape(nc, block).mean(axis=1)
+            yc = y[:nr * block].reshape(nr, block).mean(axis=1)
+            if not os.path.isfile("unwrap.grd"):
+                for f in ("phasefilt.grd", "corr.grd", "mask.grd"):
+                    if os.path.lexists(f):
+                        os.remove(f)
+                write_gmt_grd("phasefilt.grd", pc, xc, yc, node_offset=info["node_offset"])
+                write_gmt_grd("corr.grd", cc, xc, yc, node_offset=info["node_offset"])
+                write_gmt_grd("mask.grd", np.where(np.isfinite(pc), 1.0, np.nan).astype(np.float32),
+                              xc, yc, node_offset=info["node_offset"])
+                print(f"   coarse grid {nc} x {nr} (block {block}); snaphu.py {thr} {defomax} {interp}")
+                run(f"snaphu.py {thr} {defomax} {interp}")
+            if not os.path.isfile("unwrap.grd"):
+                sys.exit(f"{pair_dir}: snaphu.py produced no unwrap.grd (scroll back for a WARN)")
+            unw_c = read_gmt_grd("unwrap.grd")[0]
+            if unw_c.shape != pc.shape:
+                sys.exit(f"{pair_dir}: unwrap.grd shape {unw_c.shape} != coarse {pc.shape}")
+            full = unwrap_via_coarse(phase, unw_c, block)
+        else:
+            if not os.path.isfile("unwrap.grd"):
+                run("ln -sf ../phase.grd phasefilt.grd")
+                run("ln -sf ../corr.grd corr.grd")
+                write_gmt_grd("mask.grd", np.where(np.isfinite(phase), 1.0, np.nan).astype(np.float32),
+                              x, y, node_offset=info["node_offset"])
+                run(f"snaphu.py {thr} {defomax} {interp}")
+            if not os.path.isfile("unwrap.grd"):
+                sys.exit(f"{pair_dir}: snaphu.py produced no unwrap.grd (scroll back for a WARN)")
+            full = read_gmt_grd("unwrap.grd")[0]
+    finally:
+        os.chdir(cwd)
+    return full, x, y, info
 
 
 def main():
@@ -82,6 +114,18 @@ def main():
     ap.add_argument("--interp", choices=("0", "1"), default=None,
                     help="1 = fill gaps (nearest neighbour, then mask back) before "
                          "unwrapping via snaphu.py; default: near_interp from the config")
+    ap.add_argument("--unw-block", type=int, default=0,
+                    help="EXPERIMENTAL, off by default (0 = unwrap the full grid directly). "
+                         "N > 0: unwrap A on an N x N block-averaged grid and add the wrapped "
+                         "residual back; much faster but its effect on phase accuracy is "
+                         "untested on real data")
+    ap.add_argument("--unw-source", choices=("auto", "A", "snaphu"), default="auto",
+                    help="auto (default): reuse A's existing intf/<pair>/unwrap.grd when it "
+                         "exists, else unwrap here with snaphu.py (slow; printed). "
+                         "A: require A's unwrap (error if missing): coarsened onto the B grid, "
+                         "phi_unw = Phi + wrap(phase - Phi); cells masked in A's unwrap are "
+                         "invalid for the estimate. snaphu: always unwrap here (slow; a second, "
+                         "different unwrap of the same pair)")
     ap.add_argument("--tag", default="",
                     help="label for a variant run: writes iono_est_<tag>/ and "
                          "iono_A/<pair>/unw_<tag>/ so variants on the same list don't collide")
@@ -122,9 +166,25 @@ def main():
         if miss:
             sys.exit(f"missing {miss}")
         print(f"[{i}/{len(pairs)}] {sub}: unwrapping A")
-        unw_path = unwrap_A(f"iono_A/{sub}", thr, defomax, interp, a.tag)
-
-        phi_a, x, y, info = read_gmt_grd(unw_path)
+        ref_path = f"intf/{sub}/unwrap.grd"
+        use_a = (a.unw_source == "A"
+                 or (a.unw_source == "auto" and os.path.isfile(ref_path)))
+        if a.unw_source == "auto" and not use_a:
+            print(f"   {ref_path} not found: falling back to unwrapping A here with snaphu.py "
+                  f"(slow, and a different unwrap from A's final product)")
+        if use_a:
+            if not os.path.isfile(ref_path):
+                sys.exit(f"missing {ref_path}: --unw-source A needs A's existing unwrap")
+            phase, x, y, info = read_gmt_grd(f"iono_A/{sub}/phase.grd")
+            ref = read_gmt_grd(ref_path)[0]
+            factor = int(round(ref.shape[1] / phase.shape[1]))
+            if factor < 1 or ref.shape[0] != phase.shape[0]:
+                sys.exit(f"{sub}: A unwrap grid {ref.shape} vs B-grid phase {phase.shape}")
+            phi_a, bad = unwrap_from_reference(phase, ref, factor)
+            print(f"   A unwrap reference: factor {factor}, reference/multilook disagree "
+                  f"(|diff| > 2 rad) in {bad * 100:.2f} % of valid cells")
+        else:
+            phi_a, x, y, info = unwrap_A(f"iono_A/{sub}", thr, defomax, interp, a.tag, a.unw_block)
         coh_a = read_gmt_grd(f"iono_A/{sub}/corr.grd")[0]
         phi_b = read_gmt_grd(f"iono_B/{sub}/phase.grd")[0]
         coh_b = read_gmt_grd(f"iono_B/{sub}/corr.grd")[0]
