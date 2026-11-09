@@ -56,7 +56,18 @@ def main():
     ap.add_argument("--stop-after", type=int, default=5, choices=range(1, 6))
     ap.add_argument("--est-args", default="")
     ap.add_argument("--correct-args", default="")
-    a = ap.parse_args()
+    # argparse reads a value that starts with "--" (e.g. "--preview") as another
+    # option; glue "--est-args VALUE" into "--est-args=VALUE" first
+    argv, k = [], 1
+    while k < len(sys.argv):
+        tok = sys.argv[k]
+        if tok in ("--est-args", "--correct-args") and k + 1 < len(sys.argv):
+            argv.append(f"{tok}={sys.argv[k + 1]}")
+            k += 2
+        else:
+            argv.append(tok)
+            k += 1
+    a = ap.parse_args(argv)
 
     master = _cfg(a.config, "master_image")
     if not master:
