@@ -57,6 +57,109 @@ class TestCoarsen(unittest.TestCase):
         self.assertTrue(np.isnan(p).all() and np.isnan(c).all())
 
 
+class TestCoarseUnwrap(unittest.TestCase):
+    def test_block_mean_and_upsample(self):
+        b, ny, nx = 8, 64, 96
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        truth = 0.1 * xx + 0.04 * yy                     # wraps ~1.5 times across the grid
+        coh = np.full((ny, nx), 0.9)
+        pc, cc, nr, nc = ie.block_mean_phasor(ie.wrap(truth), coh, b)
+        self.assertEqual((nr, nc), (8, 12))
+        self.assertTrue(np.all(cc > 0.9))
+        # unwrap the coarse ramp by hand (what snaphu would return) and rebuild
+        yc, xc = np.mgrid[0:nr, 0:nc]
+        coarse_truth = 0.1 * (xc * b + (b - 1) / 2) + 0.04 * (yc * b + (b - 1) / 2)
+        self.assertLess(np.abs(ie.wrap(pc - coarse_truth)).max(), 1e-3)
+        unw = ie.unwrap_via_coarse(ie.wrap(truth), coarse_truth.astype(np.float32), b)
+        self.assertLess(np.abs(unw - truth).max(), 5e-2)
+
+    def test_noisy_cells_survive(self):
+        rng = np.random.default_rng(3)
+        b, ny, nx = 8, 128, 128
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        truth = 0.25 * xx + 0.05 * yy
+        noisy = ie.wrap(truth + rng.normal(0, 0.8, truth.shape))
+        coh = np.full(truth.shape, 0.5)
+        pc, cc, nr, nc = ie.block_mean_phasor(noisy, coh, b)
+        yc, xc = np.mgrid[0:nr, 0:nc]
+        ct = 0.25 * (xc * b + 3.5) + 0.05 * (yc * b + 3.5)
+        self.assertLess(np.abs(ie.wrap(pc - ct)).max(), 0.5)    # averaging beats the noise
+        unw = ie.unwrap_via_coarse(noisy, ct.astype(np.float32), b)
+        err = unw - truth
+        self.assertLess(np.abs(err.mean()), 0.1)                 # no 2*pi bias
+        self.assertGreater(np.mean(np.abs(err) < 3.0), 0.999)    # nearly no 2*pi slips
+
+    def test_nan_fill_and_dropped_edge(self):
+        z = np.arange(36, dtype=np.float32).reshape(6, 6)
+        z[2:4, 2:4] = np.nan
+        f = ie.fill_nearest(z, 2)
+        self.assertTrue(np.isfinite(f).all())
+        z2 = np.full((6, 6), np.nan, np.float32)
+        z2[0, 0] = 1.0
+        self.assertTrue(np.isnan(ie.fill_nearest(z2, 2)[5, 5]))
+        with self.assertRaises(ValueError):
+            ie.block_mean_phasor(np.zeros((4, 4)), np.ones((4, 4)), 8)
+
+
+class TestReference(unittest.TestCase):
+    def test_reuse_recovers_unwrapped(self):
+        rng = np.random.default_rng(5)
+        ny, nxb, f = 40, 50, 2
+        xb = np.arange(nxb)
+        truth_b = 0.4 * xb[None, :] + 0.05 * np.arange(ny)[:, None]       # unwrapped, B grid
+        noisy = ie.wrap(truth_b + rng.normal(0, 0.5, truth_b.shape))       # plain multilook
+        # A's own unwrap on a 2x finer grid (+2 extra columns like the real grids)
+        xa = (np.arange(nxb * f + 2) + 0.5) / f - 0.5
+        ref = 0.4 * xa[None, :] + 0.05 * np.arange(ny)[:, None] + 2 * np.pi      # reference one cycle off
+        phi, bad = ie.unwrap_from_reference(noisy, ref, f)
+        self.assertAlmostEqual(float(np.mean(phi - truth_b)), 2 * np.pi, delta=0.05)   # keeps the reference's cycle
+        self.assertLess(np.abs((phi - truth_b) - 2 * np.pi).max(), 2.5)              # cell noise kept, no slips
+        self.assertLess(bad, 0.01)
+
+    def test_masked_stays_nan_and_flags_bad_reference(self):
+        ny, nxb, f = 10, 20, 2
+        noisy = np.zeros((ny, nxb), dtype=np.float32)
+        ref = np.zeros((ny, nxb * f), dtype=np.float32)
+        ref[3, 10:12] = np.nan                                # masked in A's unwrap
+        phi, bad = ie.unwrap_from_reference(noisy, ref, f)
+        self.assertTrue(np.isnan(phi[3, 5]))
+        self.assertTrue(np.isfinite(phi[0, 0]))
+        ref2 = ref.copy()
+        ref2[:5] = 2.5                                        # reference disagrees with phase
+        _, bad2 = ie.unwrap_from_reference(noisy, ref2, f)
+        self.assertGreater(bad2, 0.4)
+        with self.assertRaises(ValueError):
+            ie.unwrap_from_reference(noisy, ref[:5], f)
+
+
+class TestBoxColumns(unittest.TestCase):
+    def test_fractional_ratio_exact(self):
+        # linear ramp: the box average over [j*r,(j+1)*r) is the ramp at the centre
+        r, n, ncols = 1.9995, 4000, 1900
+        x = np.arange(n, dtype=np.float64)
+        a = np.tile((0.01 * (x + 0.5)).astype(np.float32), (3, 1))
+        o = ie.box_columns(a, r, ncols)
+        centres = 0.01 * (np.arange(ncols) + 0.5) * r
+        self.assertLess(np.abs(o[0] - centres).max(), 1e-3)
+        # integer pairing at ratio 2 would be off by 0.01*0.0005*j: ~0.01 rad at the far end
+        o2 = ie.box_columns(a, 2.0, ncols)
+        self.assertGreater(np.abs(o2[0] - centres).max(), 0.005)
+
+    def test_matches_old_pairing_for_ratio_2(self):
+        a = np.arange(12, dtype=float).reshape(2, 6)
+        self.assertTrue(np.allclose(ie.box_columns(a, 2.0, 3)[0], [0.5, 2.5, 4.5]))
+
+    def test_strict_nan(self):
+        a = np.ones((1, 12), dtype=np.float32)
+        a[0, 5] = np.nan
+        o = ie.box_columns(a, 2.5, 4, strict=True)       # cells cover [0,2.5) [2.5,5) [5,7.5) [7.5,10)
+        self.assertTrue(np.isnan(o[0, 2]) and np.isfinite(o[0, [0, 1, 3]]).all())
+        o = ie.box_columns(a, 2.5, 4, strict=False)
+        self.assertTrue(np.isfinite(o).all())
+        with self.assertRaises(ValueError):
+            ie.box_columns(a, 2.5, 5)
+
+
 class TestRatio(unittest.TestCase):
     def test_gains(self):
         r, a, b = ie.band_ratio(1.239, 1.2935)

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""iono_workflow -- NISAR Frequency-B ionospheric correction, from the step-4
+products (unwrapped A interferograms) to corrected, geocoded products.
+
+Usage (case directory, after align_batch_nsr [saving SLC/offsets/] and
+intf_batch / step 4 with unwrap + geocode):
+    iono_workflow intf.in batch.config [--from-step N] [--stop-after N]
+                  [--est-args "..."] [--correct-args "..."]
+
+Steps (each resumable; a finished step is skipped on rerun):
+  1  align_batch_nsr_B      register B to the B master (SLC_B/)
+  2  intf_batch_B           B pair interferograms on the A-matched grid (iono_B/)
+  3  intf_A_on_B_grid       A complex interferograms on the B grid (iono_A/)
+  4  iono_pair_estimate     raw per-pair dispersive estimates (iono_est/)
+  5  iono_correct_stack     network inversion, per-date screens, corrected
+                            unwrapped/wrapped products, geocoding (iono_screens/, intf_iono/)
+
+--est-args / --correct-args are passed through to steps 4 / 5, e.g.
+    --correct-args "--sigma-km 8 --preview"
+
+Outputs: iono_screens/<stem>_{screen,sigma,raw}.grd (per-date screens),
+intf_iono/<pair>/ (corrected unwrap.grd, phasefilt.grd, phase.grd, ph_iono.grd
+and their geocoded _ll versions); uncorrected products stay in intf/<pair>/.
+"""
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import grep_value
+
+
+def _cfg(path, key, default=""):
+    with open(path) as f:
+        for ln in f:
+            p = ln.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def sh(cmd):
+    print(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        sys.exit(f"iono_workflow: step failed (exit {r.returncode}): {cmd[0]}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("intf_in")
+    ap.add_argument("config")
+    ap.add_argument("--from-step", type=int, default=1, choices=range(1, 6))
+    ap.add_argument("--stop-after", type=int, default=5, choices=range(1, 6))
+    ap.add_argument("--est-args", default="")
+    ap.add_argument("--correct-args", default="")
+    a = ap.parse_args()
+
+    master = _cfg(a.config, "master_image")
+    if not master:
+        sys.exit("master_image not set in config")
+    with open(a.intf_in) as f:
+        pairs = [ln.strip().split(":", 1) for ln in f if ":" in ln]
+    dates = [master]
+    for r, p in pairs:
+        for s in (r, p):
+            if s not in dates:
+                dates.append(s)
+
+    def pid(s):
+        return int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3)))
+    subs = [f"{pid(r)}_{pid(p)}" for r, p in pairs]
+    bstem = lambda s: s[:-1] + "B"
+
+    def todo(n, done):
+        if n < a.from_step or n > a.stop_after:
+            return False
+        if done:
+            print(f"step {n}: already complete, skipped")
+            return False
+        return True
+
+    # 1
+    done1 = all(os.path.isfile(f"SLC_B/{bstem(s)}.SLC") for s in dates)
+    if todo(1, done1):
+        with open("iono_B_data.in", "w") as f:
+            f.write("\n".join(dates) + "\n")
+        sh(["align_batch_nsr_B", "iono_B_data.in"])
+    # 2
+    done2 = all(os.path.isfile(f"iono_B/{s}/phase.grd") and os.path.isfile(f"iono_B/{s}/corr.grd") for s in subs)
+    if todo(2, done2):
+        sh(["intf_batch_B", a.intf_in, a.config])
+    # 3
+    done3 = all(os.path.isfile(f"iono_A/{s}/phase.grd") for s in subs)
+    if todo(3, done3):
+        sh(["intf_A_on_B_grid", a.intf_in, a.config])
+    # 4
+    done4 = all(os.path.isfile(f"iono_est/{s}/I.grd") for s in subs)
+    if todo(4, done4):
+        sh(["iono_pair_estimate", a.intf_in, a.config] + shlex.split(a.est_args))
+    # 5 (always cheap to rerun: it caches the coarse estimates; --force-style reruns via --correct-args)
+    if a.from_step <= 5 <= a.stop_after:
+        sh(["iono_correct_stack", a.intf_in, a.config] + shlex.split(a.correct_args))
+    print("\niono_workflow: done")
+
+
+if __name__ == "__main__":
+    main()

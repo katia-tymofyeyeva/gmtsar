@@ -1,0 +1,166 @@
+#! /usr/bin/env python3
+"""scene_thumbnails -- contact sheet of decimated amplitude images for a stack.
+
+Quick visual (and numeric) screen for bad scenes before spending hours on
+alignment: reads a sparse sample of rows of every NSR_*.SLC (SLC, int16
+complex, dimensions from the PRM), block-averages the amplitude to a
+thumbnail, and draws all scenes on a contact sheet (PNG). A table of simple
+per-scene statistics is printed; scenes that stand out from the rest of the
+stack (robust z-score > 3 on the mean log-amplitude, texture contrast, or
+row/column streak metrics) are flagged.
+
+Usage:  scene_thumbnails [stems_file | glob] [--raw-dir raw] [--out thumbs]
+                         [--step 60] [--avg 8] [--cols 5] [--jobs 4]
+
+  stems_file : text file with one stem per line (e.g. raw/stem_data.in);
+               default: every raw/NSR_*A.PRM that has a matching .SLC.
+Outputs:  <out>_1.png, <out>_2.png, ... (<= 15 scenes per sheet) and
+          <out>_stats.txt. Reads only about 1/8 * 1/60 of each file's rows.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import glob
+import os
+import sys
+
+import numpy as np
+
+
+def prm_value(path, key):
+    val = None
+    with open(path) as f:
+        for line in f:
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == key and v.split():
+                val = v.split()[0]
+    return val
+
+
+def thumbnail(raw_dir, stem, step, avg):
+    """Return (thumb, stats) for one scene. thumb: 2-D log-amplitude array
+    (rows = azimuth samples, columns = range blocks of `step` pixels)."""
+    prm = os.path.join(raw_dir, stem + ".PRM")
+    slc = os.path.join(raw_dir, stem + ".SLC")
+    nr = int(float(prm_value(prm, "num_rng_bins")))
+    nl = int(float(prm_value(prm, "num_patches"))) * int(float(prm_value(prm, "num_valid_az")))
+    expect = nl * nr * 4
+    size = os.path.getsize(slc)
+    mm = np.memmap(slc, dtype="<i2", mode="r").reshape(-1, 2 * nr)
+    if mm.shape[0] < nl:
+        nl = mm.shape[0]
+    nb = nr // step
+    rows = np.arange(0, nl - avg, step)
+    out = np.empty((len(rows), nb), np.float32)
+    for k, r in enumerate(rows):
+        blk = mm[r:r + avg, :2 * nb * step].astype(np.float32)
+        amp = np.hypot(blk[:, 0::2], blk[:, 1::2]).mean(axis=0)
+        out[k] = amp.reshape(nb, step).mean(axis=1)
+    th = np.log(out + 1.0)
+    # streak metrics: variation of row means / column means after removing the
+    # overall mean (large-scale terrain also gives some; compare across scenes)
+    rm = th.mean(axis=1)
+    cm = th.mean(axis=0)
+    stats = {
+        "stem": stem, "nr": nr, "nl": nl,
+        "size_ok": size == expect,
+        "mean": float(th.mean()), "std": float(th.std()),
+        "row_std": float(rm.std()), "col_std": float(cm.std()),
+        "dark_frac": float((th < th.mean() - 2.5 * th.std()).mean()),
+    }
+    return th, stats
+
+
+def robust_z(vals):
+    v = np.asarray(vals, float)
+    med = np.median(v)
+    mad = np.median(np.abs(v - med)) * 1.4826
+    return (v - med) / (mad if mad > 0 else 1.0)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("stems", nargs="?", help="file with one stem per line, or omit for raw/NSR_*A.PRM")
+    ap.add_argument("--raw-dir", default="raw")
+    ap.add_argument("--out", default="thumbs")
+    ap.add_argument("--step", type=int, default=60, help="row/column decimation (pixels)")
+    ap.add_argument("--avg", type=int, default=8, help="azimuth lines averaged per sampled row")
+    ap.add_argument("--cols", type=int, default=5)
+    ap.add_argument("--per-sheet", type=int, default=15)
+    ap.add_argument("--jobs", type=int, default=4)
+    args = ap.parse_args()
+
+    if args.stems and os.path.isfile(args.stems):
+        stems = [ln.split()[0] for ln in open(args.stems) if ln.strip()]
+    else:
+        stems = sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(args.raw_dir, "NSR_*.PRM")))
+    stems = [s for s in stems if os.path.isfile(os.path.join(args.raw_dir, s + ".SLC"))]
+    if not stems:
+        sys.exit("scene_thumbnails: no scenes found (need <raw-dir>/NSR_*.PRM and .SLC)")
+    print(f"{len(stems)} scenes; step {args.step}, avg {args.avg}", flush=True)
+
+    results = {}
+    with cf.ProcessPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        futs = {ex.submit(thumbnail, args.raw_dir, s, args.step, args.avg): s for s in stems}
+        for fut in cf.as_completed(futs):
+            s = futs[fut]
+            try:
+                results[s] = fut.result()
+            except Exception as exc:  # noqa: BLE001 -- report and keep going
+                print(f"  {s}: FAILED ({exc!r})", flush=True)
+            else:
+                print(f"  {s}: done", flush=True)
+
+    ok = [s for s in stems if s in results]
+    stats = [results[s][1] for s in ok]
+    zs = {k: robust_z([st[k] for st in stats]) for k in ("mean", "std", "row_std", "col_std", "dark_frac")}
+
+    lines = [f"{'scene':16s} {'mean':>6s} {'std':>6s} {'rowstd':>7s} {'colstd':>7s} {'dark%':>6s}  flags"]
+    for i, st in enumerate(stats):
+        flags = []
+        if not st["size_ok"]:
+            flags.append("SIZE-MISMATCH")
+        for k, name in (("mean", "brightness"), ("std", "contrast"), ("row_std", "row-streaks"),
+                        ("col_std", "col-streaks"), ("dark_frac", "dark-areas")):
+            if abs(zs[k][i]) > 3:
+                flags.append(f"{name}({zs[k][i]:+.1f})")
+        lines.append(f"{st['stem']:16s} {st['mean']:6.2f} {st['std']:6.2f} {st['row_std']:7.3f} "
+                     f"{st['col_std']:7.3f} {100 * st['dark_frac']:6.1f}  {' '.join(flags)}")
+    report = "\n".join(lines)
+    print("\n" + report)
+    with open(args.out + "_stats.txt", "w") as f:
+        f.write(report + "\n")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    allv = np.concatenate([results[s][0].ravel() for s in ok])
+    vmin, vmax = np.percentile(allv, 2), np.percentile(allv, 98)
+    n_sheets = (len(ok) + args.per_sheet - 1) // args.per_sheet
+    for sh in range(n_sheets):
+        chunk = ok[sh * args.per_sheet:(sh + 1) * args.per_sheet]
+        ncol = min(args.cols, len(chunk))
+        nrow = (len(chunk) + ncol - 1) // ncol
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 4.2 * nrow), squeeze=False)
+        for ax in axes.ravel():
+            ax.axis("off")
+        for ax, s in zip(axes.ravel(), chunk):
+            ax.imshow(results[s][0], aspect="auto", cmap="gray", vmin=vmin, vmax=vmax)
+            st = results[s][1]
+            flagged = any(abs(zs[k][ok.index(s)]) > 3 for k in zs) or not st["size_ok"]
+            ax.set_title(s + ("  <-- CHECK" if flagged else ""), fontsize=8,
+                         color="red" if flagged else "black")
+        fig.tight_layout()
+        path = f"{args.out}_{sh + 1}.png"
+        fig.savefig(path, dpi=90)
+        plt.close(fig)
+        print(f"wrote {path}")
+    print(f"wrote {args.out}_stats.txt")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,60 @@
+#! /usr/bin/env python3
+"""make_data_in_nsr — build a data.in for the NISAR batch scripts from a
+directory of granule .h5 files.
+
+Scans a directory for *.h5 files, strips the .h5 extension, and writes a
+data.in with the given master listed first and every other granule
+following — the exact format pre_proc_batch_nsr / align_batch_nsr expect
+(see gmtsar/python/docs/PATHWAY_FORWARD.md's NISAR batch entry).
+
+Usage:  make_data_in_nsr raw_dir master [output]
+  raw_dir: directory containing the .h5 granules (e.g. the case's raw/)
+  master:  the master granule's filename or basename, with or without .h5
+  output:  where to write the result (default: data.in in cwd)
+"""
+import os
+import sys
+
+
+def make_data_in_nsr():
+    argv = sys.argv
+    if len(argv) not in (3, 4):
+        sys.exit(
+            "Usage: make_data_in_nsr raw_dir master [output]\n"
+            "  raw_dir: directory containing the .h5 granules\n"
+            "  master:  master granule filename or basename (.h5 optional)\n"
+            "  output:  default data.in"
+        )
+    raw_dir, master_arg = argv[1], argv[2]
+    output = argv[3] if len(argv) == 4 else "data.in"
+
+    if not os.path.isdir(raw_dir):
+        sys.exit(f"[ERROR]: no such directory: {raw_dir}")
+
+    granules = sorted(
+        fn[:-3] for fn in os.listdir(raw_dir)
+        if fn.endswith(".h5") and os.path.isfile(os.path.join(raw_dir, fn))
+    )
+    if not granules:
+        sys.exit(f"[ERROR]: no .h5 files found in {raw_dir}")
+
+    master = master_arg[:-3] if master_arg.endswith(".h5") else master_arg
+    if master not in granules:
+        sys.exit(
+            f"[ERROR]: master {master!r} not found among the {len(granules)} "
+            f".h5 granules in {raw_dir}\n"
+            f"  found: {', '.join(granules)}"
+        )
+
+    repeats = [g for g in granules if g != master]
+
+    with open(output, "w") as f:
+        f.write(master + "\n")
+        for g in repeats:
+            f.write(g + "\n")
+
+    print(f"wrote {output}: master {master!r} + {len(repeats)} repeat(s)")
+
+
+if __name__ == "__main__":
+    make_data_in_nsr()

@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""iono_correct_stack -- from raw per-pair dispersive estimates to the final
+ionosphere-corrected products (Stages 3-5).
+
+Usage (case directory):
+    iono_correct_stack intf.in batch.config [--sigma-km 5] [--block 16]
+                       [--incidence-deg 40] [--no-geocode] [--screens-ll]
+                       [--preview] [--force] [--recompute]
+
+Needs, for every pair in intf.in:
+    iono_est/<pair>/{I,sigma}.grd      (iono_pair_estimate)
+    intf/<pair>/{unwrap,phasefilt,phase,corr}.grd and the other step-4 products
+    topo/trans.dat                      (for geocoding)
+
+What it does
+  1. block-reduce each pair's raw estimate (robust inverse-variance mean on
+     block x block cells; sigma corrected for correlated cells) -> cached in
+     iono_screens/coarse_pairs.npz;
+  2. invert the pair network per pixel (weighted LS, one datum per pair, Huber
+     IRLS against unwrapping slips) -> per-date screens relative to the master
+     date (gauge; master screen = 0) with formal sigma;
+  3. filter each date's screen once (quadratic trend, outlier rejection,
+     gap-aware normalized Gaussian, sigma = --sigma-km);
+  4. export per-date screens: iono_screens/<stem>_screen.grd (filtered),
+     _sigma.grd, _raw.grd (unfiltered inversion), in radar coordinates (A pixel
+     units) on the coarse grid;
+  5. per pair: correction = S_f(ref) - S_f(rep), interpolated onto A's grid;
+     intf_iono/<pair>/ gets  unwrap.grd = unwrap - correction,
+     phasefilt.grd and phase.grd = wrap(. - correction), ph_iono.grd = the
+     correction; then the existing `geocode` is run there (ph_iono.grd is
+     projected to ph_iono_ll.grd by it).
+The uncorrected products stay untouched in intf/<pair>/ (and their geocoded
+versions from step 4).  Corrected closure equals raw closure exactly, because the
+correction is a difference of per-date quantities.
+
+NOTE: a pair whose A unwrap was masked or failed has no estimate (the inversion
+tolerates that if the network stays connected).  Subtracting the correction from
+the unwrapped phase keeps A's cycle assignments (a re-unwrap is optional).
+"""
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gmtsar_lib import run, grep_value
+from iono_b_lib import slc_params, azimuth_pixel_m
+from iono_est_lib import wrap
+from iono_net_lib import (block_reduce, solve_network, filter_screen, interp_to_grid,
+                          check_connected)
+from gmt_grd_io import read_gmt_grd, write_gmt_grd
+
+LINK_INPUTS = ("corr.grd", "mask.grd", "display_amp.grd", "landmask_ra.grd")
+COPY_INPUTS = ("*.PRM", "*.cpt")
+
+
+def _cfg(path, key, default=""):
+    with open(path) as f:
+        for ln in f:
+            p = ln.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("intf_in")
+    ap.add_argument("config")
+    ap.add_argument("--sigma-km", type=float, default=5.0,
+                    help="Gaussian sigma of the per-date filter, km (default 5; to be tuned)")
+    ap.add_argument("--block", type=int, default=16, help="block size in B cells (default 16)")
+    ap.add_argument("--incidence-deg", type=float, default=40.0)
+    ap.add_argument("--no-geocode", action="store_true")
+    ap.add_argument("--screens-ll", action="store_true",
+                    help="EXPERIMENTAL: also geocode each date's screen (full-grid upsample)")
+    ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--force", action="store_true", help="redo pairs that already have intf_iono output")
+    ap.add_argument("--recompute", action="store_true", help="ignore the cached coarse estimates")
+    a = ap.parse_args()
+
+    master = _cfg(a.config, "master_image")
+    thr_geo = _cfg(a.config, "threshold_geocode", "0")
+    wl = float(_cfg(a.config, "iono_B_filter_wavelength") or _cfg(a.config, "filter_wavelength", "200"))
+    with open(a.intf_in) as f:
+        pairs_txt = [ln.strip().split(":", 1) for ln in f if ":" in ln]
+    if not pairs_txt:
+        sys.exit("no ref:rep lines in " + a.intf_in)
+
+    def pid(s):
+        return int(float(grep_value(f"SLC/{s}.PRM", "SC_clock_start", 3)))
+
+    dates = []
+    for r, p in pairs_txt:
+        for s in (r, p):
+            if s not in dates:
+                dates.append(s)
+    gauge = dates.index(master) if master in dates else 0
+    if master not in dates:
+        print(f"WARNING: master {master} is not in intf.in; using {dates[0]} as the screen gauge date")
+    idx = {s: k for k, s in enumerate(dates)}
+    pairs = [(idx[r], idx[p]) for r, p in pairs_txt]
+    subs = [f"{pid(r)}_{pid(p)}" for r, p in pairs_txt]
+    D, P = len(dates), len(pairs)
+    if not check_connected(pairs, D):
+        sys.exit("the pair network in intf.in is not connected: some dates cannot be tied to the others")
+    print(f"{D} dates, {P} pairs (redundancy {P - (D - 1)}); gauge date {dates[gauge]}")
+
+    pa = slc_params(f"SLC/{master}.PRM")
+    pb = slc_params(f"SLC_B/{master[:-1]}B.PRM")
+    ratio = pb["dr"] / pa["dr"]                       # A pixels per B pixel (7.998)
+    az_m = azimuth_pixel_m(f"SLC/{master}.PRM")
+    sin_inc = np.sin(np.radians(a.incidence_deg))
+    os.makedirs("iono_screens", exist_ok=True)
+
+    # ---------------------------------------------------- 1. block reduce ---
+    cache = "iono_screens/coarse_pairs.npz"
+    c = None
+    if os.path.isfile(cache) and not a.recompute:
+        z = np.load(cache, allow_pickle=True)
+        if list(z["subs"]) == subs and int(z["block"]) == a.block:
+            c = {k: z[k] for k in z.files}
+            print(f"using cached coarse estimates ({cache})")
+    if c is None:
+        Ibs, sbs = [], []
+        xc = yc = None
+        for k, sub in enumerate(subs):
+            f_i, f_s = f"iono_est/{sub}/I.grd", f"iono_est/{sub}/sigma.grd"
+            if not (os.path.isfile(f_i) and os.path.isfile(f_s)):
+                sys.exit(f"missing {f_i} / {f_s}: run iono_pair_estimate for every pair first")
+            I, x, y, info = read_gmt_grd(f_i)
+            sg = read_gmt_grd(f_s)[0]
+            cell_x_m = pb["dr"] * info["x_inc"] / sin_inc
+            cell_y_m = az_m * info["y_inc"]
+            sig_g = wl / 5.3
+            n_ind = min(1.0, cell_x_m * cell_y_m / (4 * np.pi * sig_g ** 2))
+            Ib, sb, n = block_reduce(I, sg, a.block, a.block, n_indep_per_cell=n_ind)
+            Ibs.append(Ib)
+            sbs.append(sb)
+            if xc is None:
+                nr, nc_ = Ib.shape
+                xc = x[:nc_ * a.block].reshape(nc_, a.block).mean(axis=1) * ratio   # A pixel units
+                yc = y[:nr * a.block].reshape(nr, a.block).mean(axis=1)
+                geom = {"cell_x_m": cell_x_m, "cell_y_m": cell_y_m, "node_offset": info["node_offset"]}
+            print(f"[{k + 1}/{P}] {sub}: {np.isfinite(Ib).mean() * 100:.1f} % of blocks valid")
+        c = {"subs": np.array(subs), "block": a.block, "Ib": np.stack(Ibs), "sb": np.stack(sbs),
+             "xc": xc, "yc": yc, "cell_x_m": geom["cell_x_m"], "cell_y_m": geom["cell_y_m"],
+             "node_offset": geom["node_offset"]}
+        np.savez(cache, **c)
+    xc, yc = c["xc"], c["yc"]
+    node_offset = int(c["node_offset"])
+    block_x_m = float(c["cell_x_m"]) * a.block
+    block_y_m = float(c["cell_y_m"]) * a.block
+
+    # ------------------------------------------------------- 2. invert ---
+    t0 = time.time()
+    net = solve_network(pairs, c["Ib"], c["sb"], D, gauge)
+    print(f"network inversion done in {time.time() - t0:.0f} s")
+    qc = sorted(net["qc"], key=lambda q: -q["frac_z_gt3"])
+    exp = (P - (D - 1)) / P
+    print(f"pair residual QC (rms of standardized residuals; ~{np.sqrt(max(exp, 0)):.2f} expected "
+          f"for consistent pairs, > 1.5 suspicious); worst 5 by fraction |z| > 3:")
+    for q in qc[:5]:
+        i, j = q["pair"]
+        print(f"   {dates[i][4:]}:{dates[j][4:]}  rms_z {q['rms_z']:.2f}  |z|>3 in {q['frac_z_gt3'] * 100:.1f} %  datum {q['datum']:+.2f} rad")
+    with open("iono_screens/pair_qc.txt", "w") as f:
+        f.write("ref rep n rms_z frac_z_gt3 datum_rad\n")
+        for q in net["qc"]:
+            f.write(f"{dates[q['pair'][0]]} {dates[q['pair'][1]]} {q['n']} {q['rms_z']:.3f} "
+                    f"{q['frac_z_gt3']:.4f} {q['datum']:.3f}\n")
+
+    # ------------------------------------------------------- 3. filter ---
+    sig_m = a.sigma_km * 1000.0
+    sx, sy = sig_m / block_x_m, sig_m / block_y_m
+    print(f"per-date filter: sigma {a.sigma_km:g} km = {sx:.1f} x {sy:.1f} coarse cells "
+          f"(block {block_x_m:.0f} x {block_y_m:.0f} m)")
+    ny, nx = net["S"].shape[1:]
+    Sf = np.zeros((D, ny, nx), dtype=np.float32)
+    Sg = np.zeros((D, ny, nx), dtype=np.float32)
+    for d in range(D):
+        if d == gauge:
+            continue
+        try:
+            Sf[d], Sg[d], _ = filter_screen(net["S"][d], net["sigma_S"][d], sy, sx)
+        except ValueError as e:
+            sys.exit(f"date {dates[d]}: {e}")
+
+    # ------------------------------------------------------ 4. export ---
+    for d in range(D):
+        stem = dates[d]
+        for name, arr in (("screen", Sf[d]), ("sigma", Sg[d]), ("raw", net["S"][d])):
+            write_gmt_grd(f"iono_screens/{stem}_{name}.grd", arr.astype(np.float32), xc, yc,
+                          node_offset=node_offset, title=f"{stem} ionospheric {name} (rad, A band)",
+                          description=f"relative to {dates[gauge]}; coarse grid, radar coords (A px)")
+    print(f"screens written: iono_screens/<stem>_{{screen,sigma,raw}}.grd ({D} dates)")
+    if a.preview:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            nshow = min(D, 12)
+            cols = 4
+            fig, ax = plt.subplots((nshow + cols - 1) // cols, cols, figsize=(16, 3.6 * ((nshow + cols - 1) // cols)))
+            lim = np.nanpercentile(np.abs(Sf), 98) or 1.0
+            for k, axx in enumerate(np.ravel(ax)):
+                axx.axis("off")
+                if k < nshow:
+                    im = axx.imshow(Sf[k], vmin=-lim, vmax=lim, cmap="RdBu_r", aspect="auto")
+                    axx.set_title(dates[k], fontsize=8)
+            fig.colorbar(im, ax=ax, shrink=0.6, label="rad (A band)")
+            fig.savefig("iono_screens/screens_preview.png", dpi=80)
+            plt.close(fig)
+        except Exception as e:
+            print(f"(preview skipped: {e})")
+
+    # ------------------------------------------------- 5. apply to pairs ---
+    summary = []
+    for k, ((i, j), sub) in enumerate(zip(pairs, subs), 1):
+        src, out = f"intf/{sub}", f"intf_iono/{sub}"
+        if os.path.isfile(f"{out}/unwrap_ll.grd") and not a.force:
+            print(f"[{k}/{P}] {sub}: exists, skipped")
+            continue
+        need = [f"{src}/{n}" for n in ("unwrap.grd", "phasefilt.grd", "phase.grd", "corr.grd")]
+        miss = [p for p in need if not os.path.isfile(p)]
+        if miss:
+            sys.exit(f"missing {miss}: needs the step-4 products of {sub}")
+        print(f"[{k}/{P}] {sub}: correcting")
+        unw, xt, yt, uinfo = read_gmt_grd(f"{src}/unwrap.grd")
+        corr = interp_to_grid(Sf[i] - Sf[j], xc, yc, xt, yt)
+        os.makedirs(out, exist_ok=True)
+
+        def wr(name, arr):
+            if os.path.lexists(f"{out}/{name}"):
+                os.remove(f"{out}/{name}")
+            write_gmt_grd(f"{out}/{name}", arr.astype(np.float32), xt, yt,
+                          node_offset=uinfo["node_offset"])
+        wr("unwrap.grd", unw - corr)
+        del unw
+        for name in ("phasefilt.grd", "phase.grd"):
+            ph, x2, y2, _ = read_gmt_grd(f"{src}/{name}")
+            if ph.shape != corr.shape or not (np.array_equal(x2, xt) and np.array_equal(y2, yt)):
+                sys.exit(f"{src}/{name}: grid differs from unwrap.grd")
+            wr(name, wrap(ph - corr))
+        wr("ph_iono.grd", corr)
+        summary.append((sub, float(np.nanstd(corr)), float(np.nanmin(corr)), float(np.nanmax(corr))))
+
+        # inputs geocode needs (read-only ones linked, small writable ones copied;
+        # nothing geocode WRITES is linked, so the originals in intf/ stay untouched)
+        import glob
+        import shutil
+        for nm in LINK_INPUTS:
+            if os.path.isfile(f"{src}/{nm}") and not os.path.lexists(f"{out}/{nm}"):
+                os.symlink(os.path.relpath(f"{src}/{nm}", out), f"{out}/{nm}")
+        for pat in COPY_INPUTS:
+            for fpath in glob.glob(f"{src}/{pat}"):
+                shutil.copy(fpath, out)
+        for fpath in glob.glob(f"{src}/*.LED"):
+            if not os.path.lexists(f"{out}/{os.path.basename(fpath)}"):
+                os.symlink(os.path.relpath(fpath, out), f"{out}/{os.path.basename(fpath)}")
+        if not a.no_geocode:
+            if float(thr_geo) == 0:
+                print("   threshold_geocode is 0 in the config: skipping geocode")
+            else:
+                cwd = os.getcwd()
+                os.chdir(out)
+                run("rm -f raln.grd ralt.grd trans.dat")
+                run("ln -sf ../../topo/trans.dat .")
+                run(f"geocode {thr_geo}")
+                miss = [f for f in ("unwrap_ll.grd", "phasefilt_ll.grd", "ph_iono_ll.grd", "los_ll.grd")
+                        if not os.path.isfile(f)]
+                os.chdir(cwd)
+                if miss:
+                    print(f"   WARNING {sub}: geocode did not produce {miss}")
+
+    if summary:
+        print("\ncorrection applied (rad, A band):  pair  std  min  max")
+        for s_, sd, mn, mx in summary:
+            print(f"   {s_}  {sd:.2f}  {mn:+.2f}  {mx:+.2f}")
+
+    # --------------------------------------------- 6. geocode screens (opt) ---
+    if a.screens_ll:
+        try:
+            from proj_ra2ll_lib import proj_ra2ll_fast
+        except ImportError as e:
+            print(f"--screens-ll skipped: {e}")
+            return
+        unw0, xt, yt, uinfo = read_gmt_grd(f"intf/{subs[0]}/unwrap.grd")
+        del unw0
+        os.makedirs("iono_screens_ll", exist_ok=True)
+        cwd = os.getcwd()
+        os.chdir("iono_screens_ll")
+        run("ln -sf ../topo/trans.dat .")
+        pc = {}
+        for d in range(D):
+            full = interp_to_grid(Sf[d], xc, yc, xt, yt)
+            write_gmt_grd(f"{dates[d]}_screen_ra.grd", full, xt, yt, node_offset=uinfo["node_offset"])
+            proj_ra2ll_fast("trans.dat", f"{dates[d]}_screen_ra.grd", f"{dates[d]}_screen_ll.grd", cache=pc)
+            os.remove(f"{dates[d]}_screen_ra.grd")
+        os.chdir(cwd)
+        print("geocoded screens: iono_screens_ll/<stem>_screen_ll.grd (experimental)")
+    print("\ndone")
+
+
+if __name__ == "__main__":
+    main()

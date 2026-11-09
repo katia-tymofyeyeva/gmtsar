@@ -176,12 +176,13 @@ def main():
             if not os.path.isfile(ref_path):
                 sys.exit(f"missing {ref_path}: --unw-source A needs A's existing unwrap")
             phase, x, y, info = read_gmt_grd(f"iono_A/{sub}/phase.grd")
-            ref = read_gmt_grd(ref_path)[0]
-            factor = int(round(ref.shape[1] / phase.shape[1]))
+            ref, _, _, ref_info = read_gmt_grd(ref_path)
+            # A cells per B cell in range with the true pixel ratio (7.998, not 8)
+            factor = info["x_inc"] * pb["dr"] / pa["dr"] / ref_info["x_inc"]
             if factor < 1 or ref.shape[0] != phase.shape[0]:
                 sys.exit(f"{sub}: A unwrap grid {ref.shape} vs B-grid phase {phase.shape}")
             phi_a, bad = unwrap_from_reference(phase, ref, factor)
-            print(f"   A unwrap reference: factor {factor}, reference/multilook disagree "
+            print(f"   A unwrap reference: {factor:.4f} A cells per B cell, reference/multilook disagree "
                   f"(|diff| > 2 rad) in {bad * 100:.2f} % of valid cells")
         else:
             phi_a, x, y, info = unwrap_A(f"iono_A/{sub}", thr, defomax, interp, a.tag, a.unw_block)

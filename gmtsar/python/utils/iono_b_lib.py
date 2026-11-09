@@ -54,6 +54,16 @@ def slc_params(prm):
     }
 
 
+def azimuth_pixel_m(prm):
+    """Azimuth line spacing on the ground (m), vel/sqrt(1+ht/RE)/PRF, as
+    make_gaussian_filter computes it."""
+    vel = float(read_prm_value(prm, "SC_vel"))
+    ht = float(read_prm_value(prm, "SC_height"))
+    re_ = float(read_prm_value(prm, "earth_radius"))
+    prf = float(read_prm_value(prm, "PRF"))
+    return vel / np.sqrt(1.0 + ht / re_) / prf
+
+
 def check_ab_timing(a, b, max_lines=0.1):
     """Azimuth grid reuse is only valid when A and B have the same line timing.
     Raise ValueError if PRF differs or the first-line time differs by more

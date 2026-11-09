@@ -5,9 +5,10 @@ B-band grid, from products `filter` already made (no new intf/filter run).
 B's range cell is 25 m; A's existing cells are finer (e.g. 12.5 m).  `filter`
 keeps realfilt.grd, imagfilt.grd, amp1.grd, amp2.grd (it deletes only the
 full-resolution real/imag).  A's Gaussian (sigma = wavelength/5.3, ~38 m for
-200 m) oversamples them, so averaging `factor` neighbouring cells in the
-complex domain loses nothing and is centred exactly on B's cells (shared pixel
-0; verified A/B near range identical).  Same coherence formula as `filter`.
+200 m) oversamples them, so a box average over B's cell footprint in the complex
+domain loses nothing.  The footprint uses the TRUE pixel ratio (B is 7.998 A
+pixels wide, not 8), so the two grids stay co-located across the swath (shared
+pixel 0; A/B near range identical).  Same coherence formula as `filter`.
 
 Usage (case directory, after intf_batch and intf_batch_B):
     intf_A_on_B_grid intf.in batch.config
@@ -79,13 +80,14 @@ def main():
             sys.exit(f"missing {miss}: needs intf_batch (A) and intf_batch_B outputs")
         ax, ay, anx, any_ = grd_info(f"{src}/realfilt.grd")
         bx, by, bnx, bny = grd_info(f"{bdir}/phase.grd")
+        # A cells per B cell in range, with the TRUE pixel ratio (B/A is 7.998,
+        # not 8: pairing cells in exact twos would drift ~3 A cells across the swath)
         factor = bx * d_b / d_a / ax
-        if abs(factor - round(factor)) > 0.02 * factor or round(factor) < 1:
-            sys.exit(f"{sub}: B/A range step ratio {factor:.3f} is not an integer")
-        factor = int(round(factor))
+        if factor < 1:
+            sys.exit(f"{sub}: B cell is smaller than an A cell (ratio {factor:.3f})")
         if abs(ay - by) > 1e-6 or any_ != bny:
             sys.exit(f"{sub}: azimuth grids differ: A {ay:g} x {any_}, B {by:g} x {bny}")
-        print(f"[{i}/{len(pairs)}] {sub}: A {anx}x{any_} (step {ax:g}) -> B {bnx}x{bny}, factor {factor}")
+        print(f"[{i}/{len(pairs)}] {sub}: A {anx}x{any_} (step {ax:g}) -> B {bnx}x{bny}, {factor:.4f} A cells per B cell")
 
         re, _, _, _ = read_gmt_grd(f"{src}/realfilt.grd")
         im, _, _, _ = read_gmt_grd(f"{src}/imagfilt.grd")
@@ -102,7 +104,7 @@ def main():
         for name, arr in (("phase", phase), ("corr", coh)):
             write_gmt_grd(f"{out}/{name}.grd", arr, x, y, node_offset=info["node_offset"],
                           title=f"A-band {name} on the B grid",
-                          description="intf_A_on_B_grid: complex mean of filter's realfilt/imagfilt")
+                          description="intf_A_on_B_grid: box average of filter's realfilt/imagfilt")
     print("\ndone: iono_A/<pair>/{phase,corr}.grd share the grid of iono_B/<pair>/")
 
 

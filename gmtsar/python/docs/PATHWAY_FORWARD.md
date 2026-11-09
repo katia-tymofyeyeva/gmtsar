@@ -1,5 +1,40 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-11-09: Frequency-B ionosphere workflow, end to end (stages 2-5) — synthetic tests only; NOT yet run on real data
+
+One command from step-4 products (unwrapped A interferograms) to corrected, geocoded products:
+`iono_workflow intf.in config [--from-step N] [--est-args "..."] [--correct-args "..."]`, which chains
+`align_batch_nsr_B` -> `intf_batch_B` -> `intf_A_on_B_grid` -> `iono_pair_estimate` -> `iono_correct_stack`
+(each resumable). Needs `SLC/offsets/` (from the new `align_batch_nsr`), A's step-4 `unwrap/phasefilt/phase/corr`
+per pair, `topo/trans.dat`, and a CONNECTED pair network in `intf.in`.
+
+- **Fixed (A-on-B grid):** B's pixel is 7.998 A pixels, not 8 (alignment log: `x_inc_B 8.002`); pairing A cells
+  in exact twos drifted ~3 A cells (~40 m) across the swath. `iono_est_lib.box_columns` now does an exact
+  fractional box average; `intf_A_on_B_grid` and the reference-unwrap path use the true ratio. **Existing
+  `iono_A/<pair>/` products must be regenerated** (delete `iono_A/*/phase.grd corr.grd`, rerun step 3).
+- `iono_pair_estimate` (stage 2): default `--unw-source auto` reuses A's own `intf/<pair>/unwrap.grd` as a
+  reference (`phi_unw = Phi + wrap(phase - Phi)`; no second unwrap); `snaphu` path kept (slow: ~2 days/pair on
+  plain multilooks) and a coarse-block unwrap (`--unw-block N`, experimental, accuracy untested).
+- `utils/iono_net_lib.py` (stages 3-4): `block_reduce` (robust inverse-variance mean per block, sigma corrected
+  for correlated cells), `solve_network` (per-pixel weighted LS, S_master = 0, one datum per pair, Huber IRLS
+  against unwrapping slips, standardized-residual QC), `filter_screen` (weighted quadratic trend -> 5-sigma
+  outlier rejection -> gap-aware normalized Gaussian with shrink-to-trend; one linear filter per date),
+  `interp_to_grid` (coordinate-based bilinear).
+- `utils/iono_correct_stack` (stage 5): per-date screens `iono_screens/<stem>_{screen,sigma,raw}.grd` (radar
+  coordinates, A pixel units, coarse grid; relative to the master date); per pair `intf_iono/<pair>/` with
+  `unwrap.grd = unwrap - corr`, `phasefilt.grd/phase.grd = wrap(. - corr)`, `ph_iono.grd = corr`, then the
+  existing `geocode` (which already projects `ph_iono.grd` to `ph_iono_ll.grd`). Uncorrected products stay in
+  `intf/<pair>/`. Closure of corrected pairs equals raw closure exactly (correction = F(S_ref) - F(S_rep)).
+  `--screens-ll` (experimental) geocodes the per-date screens; `--sigma-km` (default 5, UNCALIBRATED),
+  `--block` (16).
+- Tests: `test_iono_net_lib.py` (10), `test_iono_est_lib.py` (18), `test_iono_correct_stack.py` (6; integration
+  of the real driver with an in-memory grid stand-in: screens recovered to <0.15 rad rms, corrected = raw -
+  correction, closure preserved through the output files, originals untouched, geocode called per pair).
+- **Assumptions to verify on real data:** `N_eff` (approximate, from the filter width) and the correlated-cell
+  correction decide every sigma; the default filter scale; per-pair datum removal; that A's unwrap and the
+  B-grid multilook agree (`A unwrap reference ... disagree` line); screen gauge = master date; step-4 `unwrap.grd`
+  masked cells give no estimate.
+
 ## Built 2026-11-04: Frequency-B ionosphere workflow, Stages 0–1 (parameter table + stack-wise B registration) — UNTESTED ON REAL DATA
 
 Plan: `NISAR_freqB_ionosphere_strategy.md` (closure-preserving: raw per-pair dispersive estimates → per-date
