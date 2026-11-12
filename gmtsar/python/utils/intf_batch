@@ -387,6 +387,15 @@ def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
     print(f"IONO PHASE ESTIMATE - END (pair {sub})")
 
 
+def _pair_finished(sub, threshold_snaphu):
+    """True if intf/<sub>/ already holds its final geocoded product: the
+    geocoded unwrapped phase when unwrapping is on, else the geocoded filtered
+    phase.  Used only when config intf_skip_existing = 1."""
+    final = "unwrap_ll.grd" if threshold_snaphu != 0 else "phasefilt_ll.grd"
+    path = os.path.join("intf", sub, final)
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
 def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
                    threshold_snaphu, defomax, region_cut, near_interp,
                    mask_water, switch_land, threshold_geocode,
@@ -512,6 +521,14 @@ def intf_batch():
     # Added 2026-09-24 (see _topo_stage's docstring) -- default 0 keeps the
     # exact prior behavior (cleanup topo runs every time, unconditionally).
     reuse_topo        = int(_get_config(config, "reuse_topo", "0") or 0)
+    # intf_skip_existing = 1: skip pairs whose final geocoded product already
+    # exists in intf/<pair>/ (so adding a line to intf.in and rerunning only
+    # builds the new pair).  Default 0 = every pair is rebuilt, as before.
+    # It also implies reuse_topo (cleanup topo would delete the trans.dat the
+    # finished pairs link to and force the slow rebuild).
+    skip_existing     = int(_get_config(config, "intf_skip_existing", "0") or 0)
+    if skip_existing:
+        reuse_topo = 1
 
     # correct_iono support added 2026-09-21 (see _iono_split_scene's
     # docstring) -- defaults to 0/off, at which point every line below is
@@ -565,6 +582,13 @@ def intf_batch():
 
         for line in pairs:
             ref, rep = line.split(":", 1)
+            if skip_existing:
+                ref_id = int(float(grep_value(f"./SLC/{ref}.PRM", "SC_clock_start", 3)))
+                rep_id = int(float(grep_value(f"./SLC/{rep}.PRM", "SC_clock_start", 3)))
+                if _pair_finished(f"{ref_id}_{rep_id}", threshold_snaphu):
+                    print(f"INTF: pair {ref_id}_{rep_id} already complete -- skipping "
+                          "(intf_skip_existing = 1)")
+                    continue
             _intf_one_pair(
                 ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
                 threshold_snaphu, defomax, region_cut, near_interp,

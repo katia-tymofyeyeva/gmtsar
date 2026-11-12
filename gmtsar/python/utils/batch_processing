@@ -14,6 +14,22 @@ step:
   4 = interferometry                → intf_batch (stage 2 only)
   5 = phase unwrapping                TODO (intf_batch with stage=5 semantics)
   6 = geocoding                       TODO (intf_batch with stage=6 semantics)
+  7 = ionosphere correction         → iono_workflow (NISAR NSR_A only; Frequency B)
+  8 = phase-closure check           → check_closure (reads existing products only)
+
+Steps 7 and 8 run AFTER step 4 (which must include unwrap + geocode):
+  - 7 chains align_batch_nsr_B -> intf_batch_B -> intf_A_on_B_grid ->
+    iono_pair_estimate -> iono_correct_stack.  Each stage is resumable: finished
+    stages are skipped and pairs whose corrected products exist are not redone, so
+    rerunning never recomputes corrections that were already estimated.
+    Config: iono_sigma_km, iono_block (see pop_config).
+  - 8 runs check_closure on each product in `closure_products` (comma separated,
+    e.g. unwrap.grd,unwrap_ll.grd,los_ll.grd), comparing intf/ (uncorrected) with
+    intf_iono/ (ionosphere-corrected) per `closure_which` (both | uncorrected |
+    iono).  It only READS existing products; it never estimates or applies a
+    correction, and skips a set whose directory does not exist.
+    Config: closure_products, closure_which, closure_max_loops, closure_coh_min,
+    closure_stride.  Output: closure_<product>/ (PNGs per loop + stats.csv).
 
 Notes:
   - If config is omitted, pop_config is run to generate config.<SAT>.txt.
@@ -44,13 +60,37 @@ _SUPPORTED_SATS = {
 }
 
 
+def _cfg(path, key, default=""):
+    """Value (3rd token) of the first `key = value` config line, else default."""
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return default
+
+
+def closure_commands(config):
+    """check_closure command lines for step 8, from the config keys."""
+    products = [x.strip() for x in _cfg(config, "closure_products", "unwrap.grd").split(",") if x.strip()]
+    which = _cfg(config, "closure_which", "both")
+    if which not in ("both", "uncorrected", "iono", "iono-corr"):
+        sys.exit(f"[ERROR]: closure_which must be both|uncorrected|iono, got {which!r}")
+    max_loops = int(_cfg(config, "closure_max_loops", "20"))
+    coh_min = float(_cfg(config, "closure_coh_min", "0"))
+    stride = int(_cfg(config, "closure_stride", "2"))
+    return [f"check_closure {prod} --which {which} --max-loops {max_loops} "
+            f"--coh-min {coh_min:g} --stride {stride}" for prod in products]
+
+
 def batch_processing():
     argv = sys.argv
     if len(argv) not in (5, 6):
         sys.exit(
             "Usage: batch_processing SAT master_image inputfile step [config]\n"
             "  step: 1=preproc, 2=align, 3=backgeocode (TODO),\n"
-            "        4=intf, 5=unwrap (TODO), 6=geocode (TODO)"
+            "        4=intf, 5=unwrap (TODO), 6=geocode (TODO),\n"
+            "        7=ionosphere correction (NSR_A), 8=phase-closure check"
         )
     SAT, master, inputfile, step_str = argv[1], argv[2], argv[3], argv[4]
     config = argv[5] if len(argv) == 6 else None
@@ -60,8 +100,8 @@ def batch_processing():
     try:
         step = int(step_str)
     except ValueError:
-        sys.exit(f"[ERROR]: step must be 1..6, got {step_str!r}")
-    if step not in range(1, 7):
+        sys.exit(f"[ERROR]: step must be 1..8, got {step_str!r}")
+    if step not in range(1, 9):
         sys.exit(f"[ERROR]: Wrong step input: {step}")
 
     if config and not os.path.isfile(config):
@@ -105,6 +145,19 @@ def batch_processing():
     elif step == 4:
         print(f"batch_processing: step 4 — interferometry")
         run(f"intf_batch {SAT} {inputfile} {config}")
+    elif step == 7:
+        print("batch_processing: step 7 — ionosphere correction (Frequency B)")
+        if SAT != "NSR_A":
+            sys.exit("[ERROR]: step 7 (ionosphere correction with Frequency B) is NISAR only: use SAT NSR_A")
+        if not os.path.isdir("intf"):
+            sys.exit("[ERROR]: intf/ not found — run step 4 (with unwrap + geocode) first")
+        run(f"iono_workflow {inputfile} {config}")
+    elif step == 8:
+        print("batch_processing: step 8 — phase-closure check (reads existing products only)")
+        if not (os.path.isdir("intf") or os.path.isdir("intf_iono")):
+            sys.exit("[ERROR]: neither intf/ nor intf_iono/ found — run step 4 (and 7) first")
+        for cmd in closure_commands(config):
+            run(cmd)
     elif step in (3, 5, 6):
         sys.exit(
             f"[TODO]: batch_processing step {step} is not yet implemented in Python.\n"

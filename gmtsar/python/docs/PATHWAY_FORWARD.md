@@ -1,5 +1,15 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-11-10: phase-closure check as a workflow step; batch_processing steps 7 and 8
+
+- `utils/check_closure` (package copy of the standalone `Utilities/check_closure.py`): finds all closed loops (i,j,k) among the pair directories, computes phi_ij + phi_jk - phi_ik for a product, writes labelled PNGs per loop and `stats.csv` into `closure_<product>[_<which>]/`. Median removed by default, `los*` products reported in mm, products on different geocoded grids are put on a common grid by nearest-node sampling. `--which both|uncorrected|iono` compares `intf/` with `intf_iono/`.
+- `batch_processing SAT master inputfile 7 [config]` runs `iono_workflow` (NSR_A only). Resumable: finished stages and pairs with existing corrected products are skipped.
+- `batch_processing SAT master inputfile 8 [config]` runs `check_closure` once per entry of `closure_products`. It only reads existing products and never estimates or applies a correction.
+- New config keys (added to the `pop_config` template; existing config files without them fall back to defaults): `iono_sigma_km` (5.0), `iono_block` (16), `closure_products` (unwrap.grd; comma-separated), `closure_which` (both), `closure_max_loops` (20), `closure_coh_min` (0), `closure_stride` (2). `iono_correct_stack` takes `--sigma-km`/`--block` from the config unless given on the command line.
+- `intf_batch` config key `intf_skip_existing` (default 0 = unchanged: every pair in intf.in is rebuilt). With 1, a pair is skipped when `intf/<pair>/unwrap_ll.grd` exists (or `phasefilt_ll.grd` when `threshold_snaphu = 0`); it also implies `reuse_topo = 1`. Use: add a line to intf.in, rerun step 4, only the new pair is built; then rerun step 7/8 with the full intf.in. Test: `test_intf_batch_skip_existing.py`. To redo one pair, delete its final `_ll` file.
+- Tests: `bin_py/tests/test_batch_processing_iono_steps.py` (command construction with a stubbed `run`). Not run through pytest in the last sandbox session (pytest unavailable there); run once on the Mac: `python3 -m pytest gmtsar/python/bin_py/tests/test_batch_processing_iono_steps.py`.
+- Still unverified on real data: the whole ionosphere workflow, and `check_closure` on iono-corrected products.
+
 ## Built 2026-11-09: Frequency-B ionosphere workflow, end to end (stages 2-5) — synthetic tests only; NOT yet run on real data
 
 One command from step-4 products (unwrapped A interferograms) to corrected, geocoded products:

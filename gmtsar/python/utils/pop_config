@@ -124,6 +124,23 @@ defomax          = 0
 
 # -------- geocode --------
 threshold_geocode = .10
+
+# -------- rerun behaviour of step 4 --------
+# 1 = skip pairs whose final geocoded product already exists in intf/<pair>/
+#     (add a line to intf.in, rerun step 4, only the new pair is built; implies reuse_topo)
+# 0 = rebuild every pair in intf.in
+intf_skip_existing = 0
+
+# -------- ionosphere correction with Frequency B (NISAR; batch_processing step 7) --------
+iono_sigma_km = 5.0
+iono_block    = 16
+
+# -------- phase-closure check (batch_processing step 8; only reads existing products) --------
+closure_products  = unwrap.grd
+closure_which     = both
+closure_max_loops = 20
+closure_coh_min   = 0
+closure_stride    = 2
 """
 
 

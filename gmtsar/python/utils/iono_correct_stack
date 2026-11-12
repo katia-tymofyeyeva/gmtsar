@@ -70,9 +70,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("intf_in")
     ap.add_argument("config")
-    ap.add_argument("--sigma-km", type=float, default=5.0,
-                    help="Gaussian sigma of the per-date filter, km (default 5; to be tuned)")
-    ap.add_argument("--block", type=int, default=16, help="block size in B cells (default 16)")
+    ap.add_argument("--sigma-km", type=float, default=None,
+                    help="Gaussian sigma of the per-date filter, km (default: config iono_sigma_km, "
+                         "else 5; to be tuned)")
+    ap.add_argument("--block", type=int, default=None,
+                    help="block size in B cells (default: config iono_block, else 16)")
     ap.add_argument("--incidence-deg", type=float, default=40.0)
     ap.add_argument("--no-geocode", action="store_true")
     ap.add_argument("--screens-ll", action="store_true",
@@ -82,6 +84,10 @@ def main():
     ap.add_argument("--recompute", action="store_true", help="ignore the cached coarse estimates")
     a = ap.parse_args()
 
+    if a.sigma_km is None:
+        a.sigma_km = float(_cfg(a.config, "iono_sigma_km", "5.0"))
+    if a.block is None:
+        a.block = int(_cfg(a.config, "iono_block", "16"))
     master = _cfg(a.config, "master_image")
     thr_geo = _cfg(a.config, "threshold_geocode", "0")
     wl = float(_cfg(a.config, "iono_B_filter_wavelength") or _cfg(a.config, "filter_wavelength", "200"))

@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""check_closure.py -- phase closure of an interferogram stack, ionosphere-
+corrected vs uncorrected.
+
+For dates i < j < k with interferograms (i,j), (j,k), (i,k):
+    closure = phi_ij + phi_jk - phi_ik        (zero for a perfect stack)
+
+Usage (case directory):
+    python3 check_closure.py PRODUCT [--which both|uncorrected|iono | --dir DIR ...] [options]
+    e.g.  python3 check_closure.py unwrap.grd
+          python3 check_closure.py phasefilt.grd --max-loops 10
+          python3 check_closure.py unwrap_ll.grd --coh-min 0.3
+          python3 check_closure.py unwrap.grd --which iono        # corrected only (alias: iono-corr)
+          python3 check_closure.py unwrap.grd --which uncorrected # uncorrected only
+          python3 check_closure.py unwrap.grd --dir intf_iono     # any one directory
+          python3 check_closure.py unwrap.grd --dir intf --dir intf_iono_s8 --dir intf_iono_s3
+
+PRODUCT is a grid name found in each pair directory (unwrap.grd, phasefilt.grd,
+phase.grd, or a geocoded *_ll.grd).  Pair directories are named
+<ref_id>_<rep_id> (YYYYDDD).  Loops are found automatically: every triplet of
+dates for which all three pairs exist.  Uncorrected products are read from
+--uncorrected (default intf/), corrected ones from --corrected (default
+intf_iono/).  --which picks both (default), only the uncorrected, or only the
+ionosphere-corrected set ("iono" / "iono-corr"); output then goes to
+closure_<product>_<which>/ so runs don't overwrite each other.  If one directory
+is missing in "both" mode only the other is analysed.  --dir DIR (repeatable)
+overrides all of this and analyses exactly the directories given, labelled by
+name, e.g. to compare ionosphere runs made with different filter scales.
+
+Wrapped products (phasefilt, phase) get the wrapped closure.  Unwrapped products
+get the plain sum, plus the fraction of cells with |closure| > pi (cycle slips).
+By design the ionosphere correction is a difference of per-date quantities, so
+corrected and uncorrected closure should be identical; max |difference| is
+printed as a check.
+
+Output (in closure_<product>/): one PNG per loop (maps of both closures + a
+histogram, labelled with dates and pairs), stats.csv, and a table on screen.
+Needs numpy, matplotlib, netCDF4.
+"""
+import argparse
+import csv
+import datetime as dt
+import os
+import re
+import sys
+
+import numpy as np
+
+
+def read_grd(path):
+    """(z, x, y) of a GMT netCDF grid (z NaN-filled where missing)."""
+    import netCDF4
+    with netCDF4.Dataset(path) as ds:
+        xn, yn = ("x", "y") if "x" in ds.variables else ("lon", "lat")
+        z = ds.variables["z"][:]
+        z = np.ma.filled(z, np.nan).astype(np.float32) if isinstance(z, np.ma.MaskedArray) \
+            else np.asarray(z, dtype=np.float32)
+        return z, np.asarray(ds.variables[xn][:]), np.asarray(ds.variables[yn][:])
+
+
+def read_axes(path):
+    """(x, y) coordinate arrays of a GMT netCDF grid, without reading z."""
+    import netCDF4
+    with netCDF4.Dataset(path) as ds:
+        xn, yn = ("x", "y") if "x" in ds.variables else ("lon", "lat")
+        return np.asarray(ds.variables[xn][:]), np.asarray(ds.variables[yn][:])
+
+
+def common_axes(axes_list):
+    """Intersection of the extents of all grids, on the FIRST grid's nodes.
+    Geocoded (lon/lat) grids of different pairs have slightly different extents
+    (each is built from its own footprint), so they must be put on one grid
+    before they can be added."""
+    x0 = max(min(x[0], x[-1]) for x, _ in axes_list)
+    x1 = min(max(x[0], x[-1]) for x, _ in axes_list)
+    y0 = max(min(y[0], y[-1]) for _, y in axes_list)
+    y1 = min(max(y[0], y[-1]) for _, y in axes_list)
+    xf, yf = axes_list[0]
+    hx = 0.5 * abs(xf[1] - xf[0]) * 1e-3
+    hy = 0.5 * abs(yf[1] - yf[0]) * 1e-3
+    xt = xf[(xf >= x0 - hx) & (xf <= x1 + hx)]
+    yt = yf[(yf >= y0 - hy) & (yf <= y1 + hy)]
+    if xt.size < 2 or yt.size < 2:
+        raise ValueError("the grids of this loop do not overlap")
+    return xt, yt
+
+
+def resample_nearest(z, x, y, xt, yt):
+    """z on (x, y) -> (xt, yt) by nearest node (no interpolation, so wrapped
+    phase is never blended across +-pi).  Targets outside the source extent are
+    NaN.  Returns z itself if the grids already coincide."""
+    if z.shape == (len(yt), len(xt)) and np.array_equal(x, xt) and np.array_equal(y, yt):
+        return z
+    dx = (x[-1] - x[0]) / (len(x) - 1)
+    dy = (y[-1] - y[0]) / (len(y) - 1)
+    fx = (xt - x[0]) / dx
+    fy = (yt - y[0]) / dy
+    ix = np.rint(fx).astype(np.int64)
+    iy = np.rint(fy).astype(np.int64)
+    bx = (ix < 0) | (ix > len(x) - 1)
+    by = (iy < 0) | (iy > len(y) - 1)
+    out = z[np.ix_(np.clip(iy, 0, len(y) - 1), np.clip(ix, 0, len(x) - 1))].astype(np.float32)
+    out[by, :] = np.nan
+    out[:, bx] = np.nan
+    return out
+
+
+def wrap(x):
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
+def date_of(i):
+    y, doy = divmod(int(i), 1000)
+    return dt.date(y, 1, 1) + dt.timedelta(days=doy - 1)
+
+
+def pairs_in(directory, product):
+    """{(early, late): (dirname, sign)} for pair dirs that contain `product`;
+    sign -1 if the dir is stored later-date-first (phase must be negated)."""
+    out = {}
+    if not os.path.isdir(directory):
+        return out
+    for n in sorted(os.listdir(directory)):
+        m = re.match(r"^(\d{7})_(\d{7})$", n)
+        if not m or not os.path.isfile(os.path.join(directory, n, product)):
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if a == b:
+            continue
+        out[(a, b) if a < b else (b, a)] = (n, 1.0 if a < b else -1.0)
+    return out
+
+
+def find_loops(keys):
+    keys = set(keys)
+    dates = sorted({d for k in keys for d in k})
+    return [(i, j, k) for ii, i in enumerate(dates) for j in dates[ii + 1:] if (i, j) in keys
+            for k in dates if k > j and (j, k) in keys and (i, k) in keys]
+
+
+def loop_target(sets, loop, product):
+    """Common grid for one loop: intersection over all datasets and all 3 pairs."""
+    i, j, k = loop
+    axes = []
+    for d, p in sets.values():
+        for key in ((i, j), (j, k), (i, k)):
+            axes.append(read_axes(os.path.join(d, p[key][0], product)))
+    return common_axes(axes)
+
+
+def closure_of(directory, pairs, loop, product, wrapped, coh_min, target):
+    """(closure array, valid mask, x, y) for one loop in one directory, all
+    three pairs resampled onto `target` = (xt, yt)."""
+    i, j, k = loop
+    xt, yt = target
+    legs = [(pairs[(i, j)], +1), (pairs[(j, k)], +1), (pairs[(i, k)], -1)]
+    c, ok = None, None
+    cohs = []
+    for (name, orient), sgn in legs:
+        z, x, y = read_grd(os.path.join(directory, name, product))
+        z = resample_nearest(z, x, y, xt, yt)
+        c = sgn * orient * z if c is None else c + sgn * orient * z
+        ok = np.isfinite(z) if ok is None else ok & np.isfinite(z)
+        if coh_min > 0:
+            cf = os.path.join(directory, name, "corr_ll.grd" if product.endswith("_ll.grd") else "corr.grd")
+            if os.path.isfile(cf):
+                cz, cx, cy = read_grd(cf)
+                cohs.append(resample_nearest(cz, cx, cy, xt, yt))
+    for cz in cohs:
+        ok &= np.nan_to_num(cz, nan=0.0) >= coh_min
+    if wrapped:
+        c = wrap(c)
+    return c, ok, xt, yt
+
+
+def stats(c, ok, stride, unwrapped, unit="rad"):
+    v = c[::stride, ::stride][ok[::stride, ::stride] & np.isfinite(c[::stride, ::stride])].astype(np.float64)
+    if v.size == 0:
+        return {"n": 0}
+    med = np.median(v)
+    w = wrap(v)
+    s = {"n": int(v.size), "mean": v.mean(), "median": med, "std": v.std(),
+         "rms": np.sqrt(np.mean(v ** 2)), "mad_sigma": 1.4826 * np.median(np.abs(v - med)),
+         "p5": np.percentile(v, 5), "p95": np.percentile(v, 95),
+         }
+    if unit == "rad":
+        s["rms_wrapped"] = np.sqrt(np.mean(w ** 2))
+        s["frac_wrapped_gt_0p5"] = np.mean(np.abs(w) > 0.5)
+    if unwrapped and unit == "rad":
+        s["frac_cycle_slip"] = np.mean(np.abs(v) > np.pi)
+    return s
+
+
+def plot_loop(path, loop, names, product, results, vmax, stride, geographic, unit="rad"):
+    """results: list of (label, closure, valid_mask, x, y, stats)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    i, j, k = loop
+    n = len(results)
+    fig, ax = plt.subplots(1, n + 1, figsize=(5.2 * (n + 1), 5.2))
+    ax = np.atleast_1d(ax)
+    for a, (label, c, ok, x, y, st) in zip(ax, results):
+        img = np.where(ok, c, np.nan)[::stride, ::stride]
+        im = a.imshow(img, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto",
+                      extent=[x[0], x[-1], y[0], y[-1]])
+        a.set_title(f"{label}\nrms {st.get('rms', np.nan):.2f}  median removed {st.get('median_removed', np.nan):+.2f}  "
+                    f"MAD-sigma {st.get('mad_sigma', np.nan):.2f} {unit}", fontsize=9)
+        a.set_xlabel("longitude" if geographic else "range (grid x)")
+        a.set_ylabel("latitude" if geographic else "azimuth (grid y)")
+        fig.colorbar(im, ax=a, shrink=0.8, label=f"closure ({unit})")
+    ah = ax[-1]
+    for label, c, ok, x, y, st in results:
+        v = c[::stride * 2, ::stride * 2][ok[::stride * 2, ::stride * 2]]
+        v = v[np.isfinite(v)]
+        ah.hist(np.clip(v, -2 * vmax, 2 * vmax), bins=200, histtype="step", label=label, log=True)
+    ah.set_xlabel(f"closure ({unit})")
+    ah.set_ylabel("cells (log)")
+    ah.legend(fontsize=8)
+    ah.set_title("distribution")
+    fig.suptitle(f"{product}:  ({label_d(i)} \u2192 {label_d(j)}) + ({label_d(j)} \u2192 {label_d(k)}) \u2212 "
+                 f"({label_d(i)} \u2192 {label_d(k)})\npairs {names[0]}, {names[1]}, {names[2]}", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+
+
+def label_d(i):
+    return date_of(i).isoformat()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("product", help="grid name in each pair dir, e.g. unwrap.grd, phasefilt.grd, unwrap_ll.grd")
+    ap.add_argument("--uncorrected", default="intf")
+    ap.add_argument("--corrected", default="intf_iono")
+    ap.add_argument("--dir", action="append", default=None, metavar="DIR",
+                    help="analyse this directory of pair dirs instead of intf/ + intf_iono/ "
+                         "(overrides --which/--uncorrected/--corrected); repeat to compare "
+                         "several directories, each labelled by its name")
+    ap.add_argument("--which", choices=("both", "uncorrected", "iono", "iono-corr"), default="both",
+                    help="which products to analyse: both (default), uncorrected (intf/), or "
+                         "iono / iono-corr (intf_iono/ only)")
+    ap.add_argument("--out", default=None, help="output dir (default closure_<product>)")
+    ap.add_argument("--max-loops", type=int, default=20, help="analyse at most N loops, evenly spread (0 = all)")
+    ap.add_argument("--coh-min", type=float, default=0.0, help="only cells with coherence >= this in all 3 pairs")
+    ap.add_argument("--keep-median", action="store_true",
+                    help="do NOT subtract the median closure of each loop (default: it is removed, "
+                         "because each pair's unwrapping fixes its phase only up to a constant)")
+    ap.add_argument("--stride", type=int, default=2, help="subsample rows/cols for stats and plots (default 2)")
+    ap.add_argument("--vmax", type=float, default=None,
+                    help="colour scale +-vmax in the product's unit (default: pi rad; for los*.grd, "
+                         "which is in mm, the 98th percentile of |closure|)")
+    a = ap.parse_args()
+
+    product = a.product
+    unit = "mm" if product.startswith("los") else "rad"      # los*.grd = LOS displacement in mm
+    wrapped = not (product.startswith(("unwrap", "ph_iono", "los")))
+    which = "iono" if a.which == "iono-corr" else a.which
+    sources = []
+    if a.dir:
+        sources = [(os.path.basename(d.rstrip("/")) or d, d) for d in a.dir]
+        suffix = "_" + "_".join(lab for lab, _ in sources)
+    else:
+        suffix = "" if which == "both" else f"_{which}"
+        if which in ("both", "uncorrected"):
+            sources.append(("uncorrected", a.uncorrected))
+        if which in ("both", "iono"):
+            sources.append(("ionosphere-corrected", a.corrected))
+    out = a.out or f"closure_{os.path.splitext(product)[0]}{suffix}"
+    os.makedirs(out, exist_ok=True)
+    sets = {}
+    for label, d in sources:
+        p = pairs_in(d, product)
+        if p:
+            sets[label] = (d, p)
+        else:
+            print(f"(no pair directories with {product} in {d}/: skipping {label})")
+    if not sets:
+        sys.exit(f"no {product} found in " + " or ".join(f"{d}/" for _, d in sources))
+
+    common = None
+    for d, p in sets.values():
+        common = set(p) if common is None else common & set(p)
+    loops = find_loops(common)
+    print(f"{len(loops)} loops available" + (f" in all {len(sets)} datasets" if len(sets) > 1 else ""))
+    if not loops:
+        sys.exit("no complete loops (need pairs ij, jk and ik for some i<j<k)")
+    if a.max_loops > 0 and len(loops) > a.max_loops:
+        idx = np.unique(np.linspace(0, len(loops) - 1, a.max_loops).round().astype(int))
+        loops = [loops[t] for t in idx]
+        print(f"analysing {len(loops)} evenly spread loops (--max-loops 0 for all)")
+
+    rows = []
+    print(f"\n{'loop':<38}{'dataset':<22}{'rms':>7}{'removed':>9}{'MAD-sig':>9}"
+          + (f"{'|c|>.5':>8}" if unit == "rad" else f"{'unit':>6}")
+          + (f"{'slip%':>7}" if (not wrapped and unit == "rad") else ""))
+    nan = float("nan")
+    for loop in loops:
+        tag = f"{label_d(loop[0])}->{label_d(loop[1])}->{label_d(loop[2])}"
+        results, names = [], None
+        try:
+            target = loop_target(sets, loop, product)
+        except ValueError as e:
+            print(f"{tag}: skipped ({e})")
+            continue
+        for label, (d, p) in sets.items():
+            c, ok, x, y = closure_of(d, p, loop, product, wrapped, a.coh_min, target)
+            med = 0.0
+            if not a.keep_median:
+                sub = c[::a.stride, ::a.stride][ok[::a.stride, ::a.stride]]
+                sub = sub[np.isfinite(sub)]
+                med = float(np.median(sub)) if sub.size else 0.0
+                c = c - np.float32(med)
+                if wrapped:
+                    c = wrap(c)
+            st = stats(c, ok, a.stride, not wrapped, unit)
+            st["median_removed"] = med
+            results.append((label, c, ok, x, y, st))
+            names = [p[(loop[0], loop[1])][0], p[(loop[1], loop[2])][0], p[(loop[0], loop[2])][0]]
+            line = (f"{tag:<38}{label:<22}{st.get('rms', nan):>7.2f}{st.get('median_removed', nan):>+9.2f}"
+                    f"{st.get('mad_sigma', nan):>9.2f}"
+                    + (f"{100 * st.get('frac_wrapped_gt_0p5', nan):>7.1f}%" if unit == "rad" else f"{unit:>6}"))
+            if not wrapped and unit == "rad":
+                line += f"{100 * st.get('frac_cycle_slip', nan):>6.1f}%"
+            print(line)
+            rows.append({"loop": tag, "dates_id": "_".join(map(str, loop)), "dataset": label, **st})
+        if len(results) == 2:
+            _, ca, oa = results[0][:3]
+            _, cb, ob = results[1][:3]
+            both = oa & ob & np.isfinite(ca) & np.isfinite(cb)
+            dmax = float(np.abs(ca - cb)[both].max()) if both.any() else nan
+            print(f"{'':<38}max |{results[0][0]} - {results[1][0]}| closure = {dmax:.2e} {unit}")
+            rows[-1]["max_abs_diff_vs_other"] = dmax
+        png = os.path.join(out, f"closure_{os.path.splitext(product)[0]}_"
+                                f"{date_of(loop[0]):%Y%m%d}_{date_of(loop[1]):%Y%m%d}_{date_of(loop[2]):%Y%m%d}.png")
+        vmax = a.vmax
+        if vmax is None:
+            vmax = np.pi
+            if unit != "rad":
+                v = np.concatenate([np.abs(c[::8, ::8][ok[::8, ::8] & np.isfinite(c[::8, ::8])])
+                                    for _, c, ok, _, _, _ in results])
+                vmax = max(float(np.percentile(v, 98)), 1e-6) if v.size else 1.0
+        plot_loop(png, loop, names, product, results, vmax, a.stride, product.endswith("_ll.grd"), unit)
+
+    keys = sorted({k for r in rows for k in r})
+    with open(os.path.join(out, "stats.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nwrote {len(loops)} PNGs and stats.csv in {out}/")
+
+
+if __name__ == "__main__":
+    main()
