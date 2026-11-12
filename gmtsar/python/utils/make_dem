@@ -19,7 +19,7 @@ Output: dem.grd (heights relative to WGS84 ellipsoid).
 import os
 import subprocess
 import sys
-from gmtsar_lib import run
+from gmtsar_lib import run, resolve_sharedir
 
 # Mira GMTSAR_GRDMATH_PY wire-in: numpy replacements for `gmt grdmath` ops.
 # Default ON (GMTSAR_GRDMATH_PY=1); set =0 to force the gmt subprocess.
@@ -69,10 +69,11 @@ def make_dem():
     R = f"-R{W}/{E}/{S}/{N}"
 
     # Resolve the GMTSAR share dir (where geoid_egm96_icgem.grd lives)
-    gmtsar = os.environ.get('GMTSAR')
-    if not gmtsar:
-        sys.exit("make_dem: $GMTSAR not set")
-    sharedir = os.path.join(gmtsar, 'share', 'gmtsar')
+    # ($GMTSAR if set, else located relative to this script -- same lookup
+    # as filter / fitoffset; previously make_dem alone demanded $GMTSAR)
+    sharedir = resolve_sharedir()
+    if not os.path.isfile(os.path.join(sharedir, "geoid_egm96_icgem.grd")):
+        sys.exit(f"make_dem: geoid_egm96_icgem.grd not found in {sharedir}")
 
     relief = "@earth_relief_01s" if mode == 1 else "@earth_relief_03s"
     run(f"gmt grdcut {relief} {R} -Gdem_ortho.grd")
