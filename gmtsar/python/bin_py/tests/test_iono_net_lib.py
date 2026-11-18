@@ -184,6 +184,76 @@ class TestInterp(unittest.TestCase):
         self.assertTrue(np.isnan(o[10, 10]))
         self.assertTrue(np.isfinite(o[0, 0]) and np.isfinite(o[18, 18]))
 
+class TestFastPaths(unittest.TestCase):
+    """Sparse assembly / selective IRLS / fast sigma / low-memory convolution."""
+
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        self.D = 9
+        self.pairs = [(i, j) for i in range(self.D) for j in range(i + 1, min(self.D, i + 3))]
+        P = len(self.pairs)
+        S = rng.normal(size=(self.D, 12, 30))
+        S[0] = 0
+        self.c = rng.uniform(-2, 2, P)
+        self.I = np.stack([S[i] - S[j] + self.c[p] for p, (i, j) in enumerate(self.pairs)])
+        self.I += rng.normal(0, 0.3, self.I.shape)
+        self.I[rng.random(self.I.shape) < 0.02] += 6.0
+        self.sig = rng.uniform(0.2, 0.5, self.I.shape)
+        self.S = S
+
+    def test_fixed_datum_matches_dense_reference(self):
+        r = nl.solve_network(self.pairs, self.I, self.sig, self.D, 0, datum=self.c, chunk=50)
+        # dense reference: per-pixel IRLS with the same rules
+        A = np.zeros((len(self.pairs), self.D - 1))
+        for p, (i, j) in enumerate(self.pairs):
+            if i:
+                A[p, i - 1] += 1
+            if j:
+                A[p, j - 1] -= 1
+        for (yy, xx) in ((0, 0), (5, 17), (11, 29)):
+            y = self.I[:, yy, xx] - self.c
+            w0 = 1 / self.sig[:, yy, xx] ** 2
+            w = w0.copy()
+            for it in range(3):
+                N = A.T @ (w[:, None] * A)
+                N += 1e-6 * np.trace(N) / N.shape[0] * np.eye(N.shape[0])
+                s = np.linalg.solve(N, A.T @ (w * y))
+                z = (y - A @ s) * np.sqrt(w0)
+                w = w0 * np.where(np.abs(z) > 2.5, 2.5 / np.abs(z), 1.0)
+            np.testing.assert_allclose(r["S"][1:, yy, xx], s, atol=1e-5)
+            np.testing.assert_allclose(r["sigma_S"][1:, yy, xx], np.sqrt(np.diag(np.linalg.inv(N))), rtol=1e-4)
+
+    def test_fast_sigma_same_screens_lower_bound(self):
+        a = nl.solve_network(self.pairs, self.I, self.sig, self.D, 0, datum=self.c)
+        b = nl.solve_network(self.pairs, self.I, self.sig, self.D, 0, datum=self.c, exact_sigma=False)
+        np.testing.assert_allclose(a["S"], b["S"], atol=1e-5)
+        self.assertTrue(np.all(b["sigma_S"][1:] <= a["sigma_S"][1:] * (1 + 1e-5)))
+
+    def test_lowmem_convolution_equals_2d_fft(self):
+        rng = np.random.default_rng(0)
+        a = rng.random((70, 130))
+        ky, kx = nl._gauss_kernel(3), nl._gauss_kernel(9)
+        ny, nx = a.shape
+        py, px = len(ky) // 2, len(kx) // 2
+        # direct zero-padded convolution
+        full = np.zeros((ny + len(ky) - 1, nx + len(kx) - 1))
+        for i, kyv in enumerate(ky):
+            for j, kxv in enumerate(kx):
+                full[i:i + ny, j:j + nx] += kyv * kxv * a
+        np.testing.assert_allclose(nl._conv2_sep(a, ky, kx), full[py:py + ny, px:px + nx], atol=1e-12)
+
+
+    def test_posterior_sigma_in_filled_gaps(self):
+        rng = np.random.default_rng(5)
+        S = rng.normal(0, 0.5, (80, 160))
+        S[:, 100:] = np.nan                                   # wide data-free strip
+        sg = np.full_like(S, 0.5)
+        f0, s0, _ = nl.filter_screen(S, sg, 3, 3)
+        f1, s1, _ = nl.filter_screen(S, sg, 3, 3, posterior_sigma=True)
+        np.testing.assert_array_equal(f0, f1)                 # values unchanged
+        self.assertLess(s0[:, 150].max(), 0.05)               # formal sigma -> ~0 far from data
+        self.assertGreater(s1[:, 150].min(), 0.3)             # posterior ~ residual spread
+        self.assertLess(np.median(s1[:, 20:80]), 0.2)         # small where there is data
 
 if __name__ == "__main__":
     unittest.main()

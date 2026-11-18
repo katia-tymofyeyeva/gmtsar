@@ -18,6 +18,11 @@ Steps (each resumable; a finished step is skipped on rerun):
 --est-args / --correct-args are passed through to steps 4 / 5, e.g.
     --correct-args "--sigma-km 8 --preview"
 
+Config iono_method = sbas (or --correct-args="--method sbas") makes step 5 filter
+each pair's estimate and then invert them at full resolution (SBAS-like, no
+filtering of the screens afterwards); outputs then go to
+iono_screens_sbas/ and intf_iono_sbas/ instead of the directories below.
+
 Outputs: iono_screens/<stem>_{screen,sigma,raw}.grd (per-date screens),
 intf_iono/<pair>/ (corrected unwrap.grd, phasefilt.grd, phase.grd, ph_iono.grd
 and their geocoded _ll versions); uncorrected products stay in intf/<pair>/.

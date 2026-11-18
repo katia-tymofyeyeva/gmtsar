@@ -73,3 +73,9 @@ def test_step7_calls_workflow(tmp_path, monkeypatch):
 def test_step7_requires_nisar_a(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         run_step(tmp_path, monkeypatch, 7, sat="S1_TOPS", dirs=("intf",))
+
+
+def test_step8_sbas_reads_intf_iono_sbas(tmp_path, monkeypatch):
+    calls = run_step(tmp_path, monkeypatch, 8, cfg="iono_method = sbas\n")
+    assert calls == ["check_closure unwrap.grd --which both --max-loops 20 --coh-min 0 --stride 2"
+                     " --corrected intf_iono_sbas"]

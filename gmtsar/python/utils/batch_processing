@@ -22,7 +22,7 @@ Steps 7 and 8 run AFTER step 4 (which must include unwrap + geocode):
     iono_pair_estimate -> iono_correct_stack.  Each stage is resumable: finished
     stages are skipped and pairs whose corrected products exist are not redone, so
     rerunning never recomputes corrections that were already estimated.
-    Config: iono_sigma_km, iono_block (see pop_config).
+    Config: iono_method (network | sbas), iono_sigma_km, iono_block (see pop_config).
   - 8 runs check_closure on each product in `closure_products` (comma separated,
     e.g. unwrap.grd,unwrap_ll.grd,los_ll.grd), comparing intf/ (uncorrected) with
     intf_iono/ (ionosphere-corrected) per `closure_which` (both | uncorrected |
@@ -79,8 +79,10 @@ def closure_commands(config):
     max_loops = int(_cfg(config, "closure_max_loops", "20"))
     coh_min = float(_cfg(config, "closure_coh_min", "0"))
     stride = int(_cfg(config, "closure_stride", "2"))
+    # corrected products live in intf_iono_sbas/ when iono_method = sbas
+    corrected = " --corrected intf_iono_sbas" if _cfg(config, "iono_method", "network") == "sbas" else ""
     return [f"check_closure {prod} --which {which} --max-loops {max_loops} "
-            f"--coh-min {coh_min:g} --stride {stride}" for prod in products]
+            f"--coh-min {coh_min:g} --stride {stride}{corrected}" for prod in products]
 
 
 def batch_processing():
