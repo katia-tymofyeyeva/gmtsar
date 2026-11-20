@@ -27,7 +27,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import run, grep_value
+from gmtsar_lib import run, grep_value, progress
 from iono_b_lib import b_decimation, slc_params
 
 
@@ -141,8 +141,10 @@ def main():
         sub = f"{pid(ref)}_{pid(rep)}"
         if os.path.isfile(f"iono_B/{sub}/phasefilt.grd"):
             print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            progress("step 7.2 B interferograms", f"pair {sub}: exists, skipped", i, len(pairs))
             continue
         print(f"[{i}/{len(pairs)}] {sub}")
+        progress("step 7.2 B interferograms", f"pair {sub} ({b_stem(ref)}:{b_stem(rep)})", i, len(pairs))
         if not one_pair(ref, rep, wl, dec_args, sub):
             failed.append(sub)
             print(f"FAILED {sub}: phase/phasefilt/corr.grd missing (scroll back for a WARN)")

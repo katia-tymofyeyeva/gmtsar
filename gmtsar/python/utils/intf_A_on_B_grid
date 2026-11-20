@@ -26,7 +26,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import grep_value
+from gmtsar_lib import grep_value, progress
 from iono_b_lib import slc_params
 from iono_est_lib import complex_on_coarse_grid
 from gmt_grd_io import read_gmt_grd, write_gmt_grd
@@ -71,6 +71,7 @@ def main():
         out = f"iono_A/{sub}"
         if os.path.isfile(f"{out}/phase.grd") and os.path.isfile(f"{out}/corr.grd"):
             print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            progress("step 7.3 A on the B grid", f"pair {sub}: exists, skipped", i, len(pairs))
             continue
         src, bdir = f"intf/{sub}", f"iono_B/{sub}"
         need = [f"{src}/{f}" for f in ("realfilt.grd", "imagfilt.grd", "amp1.grd", "amp2.grd")]
@@ -87,6 +88,7 @@ def main():
             sys.exit(f"{sub}: B cell is smaller than an A cell (ratio {factor:.3f})")
         if abs(ay - by) > 1e-6 or any_ != bny:
             sys.exit(f"{sub}: azimuth grids differ: A {ay:g} x {any_}, B {by:g} x {bny}")
+        progress("step 7.3 A on the B grid", f"pair {sub}", i, len(pairs))
         print(f"[{i}/{len(pairs)}] {sub}: A {anx}x{any_} (step {ax:g}) -> B {bnx}x{bny}, {factor:.4f} A cells per B cell")
 
         re, _, _, _ = read_gmt_grd(f"{src}/realfilt.grd")

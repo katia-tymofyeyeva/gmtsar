@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""nisar_stack_auto -- run the whole NISAR batch workflow, from a raw/ folder of
+RSLC .h5 granules to corrected, geocoded interferograms and closure checks.
+
+Usage (from anywhere):
+    nisar_stack_auto RAW_DIR MASTER_GRANULE --max-days DAYS --max-bperp METERS [options]
+
+    RAW_DIR          folder holding the RSLC .h5 files; the case directory is its parent
+                     (topo/, SLC/, intf/, ... are created there), or --case DIR
+    MASTER_GRANULE   the master RSLC file name, with or without .h5
+    --max-days       longest interferogram time span to use (days, inclusive)
+    --max-bperp      largest perpendicular-baseline difference to use (m, inclusive)
+
+Stages (each is skipped if its outputs already exist, so a rerun resumes where it stopped):
+  setup     data.in (master first), config.NSR_A.txt from pop_config; on a new config these
+            override pop_config's defaults: threshold_snaphu = 0.1, near_interp = 1 (fill
+            low-coherence holes before unwrapping), intf_skip_existing = 1; then --set overrides
+  dem       topo/dem.grd: extent = union of the granule footprints + --dem-pad, then make_dem
+            (or --dem FILE / --region W/E/S/N)
+  preproc   batch_processing step 1 (both bands); master_image written into the config
+            from raw/stem_data.in
+  align     batch_processing step 2
+  pairs     select_pairs on raw/baseline_table.dat -> raw/intf.in; network connectivity check
+  intf      batch_processing step 4 (interferograms, unwrapping, geocoding)
+  iono      batch_processing step 7 (Frequency-B ionosphere correction; --no-iono to skip)
+  closure   batch_processing step 8 (phase-closure check; --no-closure to skip)
+
+Options:
+  --case DIR          case directory (default: the parent of RAW_DIR)
+  --dem FILE          use this DEM (copied/linked to topo/dem.grd) instead of make_dem
+  --region W/E/S/N    DEM extent instead of the granule footprints
+  --dem-pad DEG       margin around the footprints (default 0.2)
+  --dem-mode 1|2      make_dem mode: 1 = SRTM 1 arcsec (default), 2 = 3 arcsec
+  --set KEY=VALUE     set a config key (repeatable), e.g. --set iono_method=sbas
+  --stop-after STAGE  stop after this stage
+  --no-iono, --no-closure
+
+batch_processing's inner commands only warn on failure, so each stage is checked by its
+outputs, and the run stops with a message if they are missing.
+
+Following the run:
+  <case>/nisar_stack_auto.status   always the current state, e.g.
+        stage 6/8 intf (since 14:02) | >>> 2026-11-20 15:41:07 | step 4 interferograms |
+        [12/66] pair 2026058_2026094: unwrapping (snaphu, threshold 0.1)
+  <case>/nisar_stack_auto.log      everything; progress lines start with ">>>":
+        grep '>>>' nisar_stack_auto.log | tail     (what it did last)
+"""
+import argparse
+import datetime as dt
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+STAGES = ["setup", "dem", "preproc", "align", "pairs", "intf", "iono", "closure"]
+CONFIG = "config.NSR_A.txt"
+LOG = None
+STATUS = "nisar_stack_auto.status"
+_STAGE = ""
+# config values that override pop_config's defaults on a NEW config (--set still wins)
+AUTO_DEFAULTS = [("threshold_snaphu", "0.1", "unwrapping is needed for the ionosphere step"),
+                 ("near_interp", "1", "fill low-coherence holes before unwrapping"),
+                 ("intf_skip_existing", "1", "a rerun only builds missing interferograms")]
+
+
+# ------------------------------------------------------------------ helpers ---
+def log(msg=""):
+    line = f"{msg}"
+    print(line, flush=True)
+    if LOG:
+        LOG.write(line + "\n")
+        LOG.flush()
+
+
+def status(line):
+    """Rewrite the one-line status file (what is running right now)."""
+    try:
+        with open(STATUS, "w") as f:
+            f.write(f"{_STAGE} | {line.strip()}\n")
+    except OSError:
+        pass
+
+
+def banner(stage, text):
+    global _STAGE
+    now = dt.datetime.now()
+    _STAGE = f"stage {STAGES.index(stage) + 1}/{len(STAGES)} {stage} (since {now:%H:%M})"
+    line = f">>> {now:%Y-%m-%d %H:%M:%S} | nisar_stack_auto | stage {STAGES.index(stage) + 1}/{len(STAGES)} " \
+           f"{stage}: {text}"
+    log(f"\n{'=' * 78}\n{line}\n{'=' * 78}")
+    status(line)
+
+
+def sh(cmd, cwd=None):
+    """Run a command, streaming its output to the screen and the log; exit on failure."""
+    log(f"$ {cmd}" + (f"    (in {cwd})" if cwd else ""))
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1)
+    for line in p.stdout:
+        sys.stdout.write(line)
+        if LOG:
+            LOG.write(line)
+        if line.startswith(">>>"):
+            status(line)
+    p.wait()
+    if LOG:
+        LOG.flush()
+    if p.returncode != 0:
+        fail(f"command failed (exit {p.returncode}): {cmd}")
+
+
+def fail(msg):
+    log(f"\nnisar_stack_auto: STOPPED: {msg}")
+    status(f"STOPPED {dt.datetime.now():%Y-%m-%d %H:%M:%S}: {msg}")
+    sys.exit(1)
+
+
+def cfg_get(path, key, default=None):
+    """3rd token of the first non-comment `key = value` line (same rule as the pipeline)."""
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 3 and p[0] == key and not line.lstrip().startswith("#"):
+                return p[2]
+    return default
+
+
+def cfg_set(path, key, value):
+    """Set `key = value`: replace the first non-comment line for key, else append."""
+    with open(path) as f:
+        lines = f.readlines()
+    new = f"{key} = {value}\n"
+    for k, line in enumerate(lines):
+        p = line.split()
+        if p and p[0] == key and not line.lstrip().startswith("#"):
+            lines[k] = new
+            break
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(new)
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+
+def prm_value(path, key):
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 3 and p[0] == key:
+                return p[2]
+    return None
+
+
+def pair_id(case, stem):
+    return int(float(prm_value(os.path.join(case, "SLC", f"{stem}.PRM"), "SC_clock_start")))
+
+
+# ------------------------------------------------------------ DEM extent ---
+_NUM = r"[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?"
+_PAIR = re.compile(rf"({_NUM})\s+({_NUM})(?:\s+{_NUM})?\s*(?:,|\))")
+
+
+def polygon_lonlat(wkt):
+    return [(float(a), float(b)) for a, b in _PAIR.findall(wkt)]
+
+
+def granule_lonlat(path):
+    """lon/lat points of a granule's footprint: identification/boundingPolygon, else the
+    RSLC geolocation grid.  Both dataset paths follow the NISAR product layout as I know it;
+    verified only by the error message if they are absent."""
+    import h5py
+    import numpy as np
+    with h5py.File(path, "r") as f:
+        for band in ("LSAR", "SSAR"):
+            key = f"/science/{band}/identification/boundingPolygon"
+            if key in f:
+                v = f[key][()]
+                pts = polygon_lonlat(v.decode() if isinstance(v, bytes) else str(v))
+                if pts:
+                    return pts
+            g = f"/science/{band}/RSLC/metadata/geolocationGrid"
+            if f"{g}/coordinateX" in f and f"{g}/coordinateY" in f:
+                epsg = int(f[f"{g}/epsg"][()]) if f"{g}/epsg" in f else 4326
+                if epsg != 4326:
+                    continue
+                x = np.asarray(f[f"{g}/coordinateX"][()], dtype=float).ravel()
+                y = np.asarray(f[f"{g}/coordinateY"][()], dtype=float).ravel()
+                ok = np.isfinite(x) & np.isfinite(y)
+                return list(zip(x[ok], y[ok]))
+    raise KeyError("no identification/boundingPolygon or RSLC geolocationGrid found")
+
+
+def dem_region(files, pad, step=0.05):
+    import math
+    pts = []
+    for p in files:
+        pts += granule_lonlat(p)
+    lons, lats = [q[0] for q in pts], [q[1] for q in pts]
+    if max(lons) - min(lons) > 180:
+        lons = [x % 360 for x in lons]
+    r = lambda v, f: round(f(v / step) * step, 6)
+    return (r(min(lons) - pad, math.floor), r(max(lons) + pad, math.ceil),
+            max(-90.0, r(min(lats) - pad, math.floor)), min(90.0, r(max(lats) + pad, math.ceil)))
+
+
+# --------------------------------------------------------------- network ---
+def components(nodes, pairs):
+    parent = {n: n for n in nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for a, b in pairs:
+        parent[find(a)] = find(b)
+    groups = {}
+    for n in nodes:
+        groups.setdefault(find(n), []).append(n)
+    return sorted(groups.values(), key=len, reverse=True)
+
+
+def read_pairs(path):
+    with open(path) as f:
+        return [tuple(ln.strip().split(":", 1)) for ln in f if ":" in ln]
+
+
+# ------------------------------------------------------------------- main ---
+def main():
+    global LOG
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("raw_dir")
+    ap.add_argument("master")
+    ap.add_argument("--max-days", type=float, required=True)
+    ap.add_argument("--max-bperp", type=float, required=True)
+    ap.add_argument("--case")
+    ap.add_argument("--dem")
+    ap.add_argument("--region")
+    ap.add_argument("--dem-pad", type=float, default=0.2)
+    ap.add_argument("--dem-mode", type=int, choices=(1, 2), default=1)
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--stop-after", choices=STAGES)
+    ap.add_argument("--no-iono", action="store_true")
+    ap.add_argument("--no-closure", action="store_true")
+    # a value starting with "-" (a western longitude: --region -118/-117/34/35) would be read
+    # as another option; glue "--region VALUE" / "--set VALUE" into "--region=VALUE" first
+    argv, k = [], 1
+    while k < len(sys.argv):
+        tok = sys.argv[k]
+        if tok in ("--region", "--set") and k + 1 < len(sys.argv):
+            argv.append(f"{tok}={sys.argv[k + 1]}")
+            k += 2
+        else:
+            argv.append(tok)
+            k += 1
+    a = ap.parse_args(argv)
+
+    raw = os.path.abspath(os.path.expanduser(a.raw_dir))
+    case = os.path.abspath(os.path.expanduser(a.case)) if a.case else os.path.dirname(raw)
+    if not os.path.isdir(raw):
+        sys.exit(f"no such directory: {raw}")
+    if os.path.realpath(os.path.join(case, "raw")) != os.path.realpath(raw):
+        sys.exit(f"the pipeline expects the granules in <case>/raw; {raw} is not {case}/raw "
+                 "(move or link the folder, or pass --case)")
+    granules = sorted(f[:-3] for f in os.listdir(raw) if f.endswith(".h5"))
+    master = a.master[:-3] if a.master.endswith(".h5") else os.path.basename(a.master)
+    if not granules:
+        sys.exit(f"no .h5 files in {raw}")
+    if master not in granules:
+        sys.exit(f"master {master!r} is not among the {len(granules)} .h5 files in {raw}")
+    sets = []
+    for kv in a.set:
+        if "=" not in kv:
+            sys.exit(f"--set needs KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        sets.append((k.strip(), v.strip()))
+    missing = [c for c in ("pop_config", "batch_processing", "select_pairs", "make_dem", "gmt")
+               if shutil.which(c) is None]
+    if missing:
+        sys.exit(f"not on PATH: {', '.join(missing)} (install.py, or export PATH=$GMTSAR/bin:$PATH)")
+
+    os.chdir(case)
+    LOG = open("nisar_stack_auto.log", "a")
+    log(f"\nnisar_stack_auto started {dt.datetime.now():%Y-%m-%d %H:%M:%S}: case {case}, "
+        f"{len(granules)} granules, master {master}, max {a.max_days:g} days / {a.max_bperp:g} m")
+    def stop(s):
+        if a.stop_after == s:
+            log(f"\nstopped after stage {s} (--stop-after)")
+            status(f"stopped after stage {s} (--stop-after) {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+            return True
+        return False
+    bp = f"batch_processing NSR_A {master}"
+
+    # ---- setup ----------------------------------------------------------------
+    banner("setup", "data.in and config")
+    with open("data.in", "w") as f:
+        f.write("\n".join([master] + [g for g in granules if g != master]) + "\n")
+    log(f"data.in: master {master} + {len(granules) - 1} repeat(s)")
+    if not os.path.isfile(CONFIG):
+        sh(f"pop_config NSR_A > {CONFIG}")
+        for k, v, why in AUTO_DEFAULTS:
+            cfg_set(CONFIG, k, v)
+            log(f"config: {k} = {v} ({why})")
+    else:
+        log(f"{CONFIG} exists: kept (only --set and master_image are applied)")
+    for k, v in sets:
+        cfg_set(CONFIG, k, v)
+        log(f"config: {k} = {v}")
+    if stop("setup"):
+        return
+
+    # ---- dem ------------------------------------------------------------------
+    banner("dem", "topo/dem.grd")
+    os.makedirs("topo", exist_ok=True)
+    if os.path.isfile("topo/dem.grd") and not a.dem:
+        log("topo/dem.grd exists: kept")
+    elif a.dem:
+        src = os.path.abspath(os.path.expanduser(a.dem))
+        if not os.path.isfile(src):
+            fail(f"--dem {src} not found")
+        if os.path.realpath(src) != os.path.realpath("topo/dem.grd"):
+            if os.path.lexists("topo/dem.grd"):
+                os.remove("topo/dem.grd")
+            os.symlink(src, "topo/dem.grd")
+        log(f"topo/dem.grd -> {src}")
+    else:
+        if a.region:
+            try:
+                W, E, S, N = (float(v) for v in a.region.split("/"))
+            except ValueError:
+                fail(f"--region must be W/E/S/N in degrees, got {a.region!r}")
+            log(f"DEM extent from --region: {W:g}/{E:g}/{S:g}/{N:g}")
+        else:
+            try:
+                W, E, S, N = dem_region([os.path.join(raw, g + ".h5") for g in granules], a.dem_pad)
+            except Exception as e:
+                fail(f"could not read the granule footprints ({e}); pass --region W/E/S/N or --dem FILE")
+            log(f"DEM extent: union of {len(granules)} footprints + {a.dem_pad:g} deg = "
+                f"W {W:g} E {E:g} S {S:g} N {N:g}")
+        sh(f"make_dem {W:g} {E:g} {S:g} {N:g} {a.dem_mode}", cwd="topo")
+        if not os.path.isfile("topo/dem.grd"):
+            fail("make_dem did not produce topo/dem.grd")
+    if stop("dem"):
+        return
+
+    # ---- preproc ----------------------------------------------------------------
+    banner("preproc", "batch_processing step 1")
+    stem_in = os.path.join("raw", "stem_data.in")
+
+    def preproc_done():
+        if not os.path.isfile(stem_in):
+            return False
+        stems = [s.strip() for s in open(stem_in) if s.strip()]
+        return (len(stems) == len(granules) and os.path.isfile("raw/baseline_table.dat")
+                and all(os.path.isfile(f"raw/{s}.SLC") and os.path.isfile(f"raw/{s[:-1]}B.SLC") for s in stems))
+    if preproc_done():
+        log("already done: raw/stem_data.in and all A/B SLCs exist")
+        status("already done, skipped")
+    else:
+        sh(f"{bp} data.in 1 {CONFIG}")
+        if not preproc_done():
+            fail("step 1 did not produce raw/stem_data.in, raw/baseline_table.dat and every "
+                 "NSR_<date>A/B.SLC in raw/ (see the log above)")
+    stems = [s.strip() for s in open(stem_in) if s.strip()]
+    master_stem = stems[0]
+    cfg_set(CONFIG, "master_image", master_stem)
+    log(f"config: master_image = {master_stem}")
+    if stop("preproc"):
+        return
+
+    # ---- align ----------------------------------------------------------------
+    banner("align", "batch_processing step 2")
+
+    def align_done():
+        return (all(os.path.isfile(f"SLC/{s}.SLC") and os.path.isfile(f"SLC/{s}.PRM") for s in stems)
+                and all(os.path.isfile(f"SLC/offsets/{s}_r.grd") for s in stems[1:]))
+    if align_done():
+        log("already done: SLC/ and SLC/offsets/ complete")
+        status("already done, skipped")
+    else:
+        sh(f"{bp} data.in 2 {CONFIG}")
+        if not align_done():
+            fail("step 2 did not produce every SLC/<stem>.SLC and SLC/offsets/<stem>_r.grd")
+    if stop("align"):
+        return
+
+    # ---- pairs ----------------------------------------------------------------
+    banner("pairs", f"network: <= {a.max_days:g} days, <= {a.max_bperp:g} m")
+    # select_pairs keeps pairs strictly below the thresholds; nudge them so the limits are inclusive
+    sh(f"select_pairs baseline_table.dat {a.max_days + 1e-3:g} {a.max_bperp + 1e-3:g}", cwd="raw")
+    if not os.path.isfile("raw/intf.in"):
+        fail("select_pairs did not write raw/intf.in")
+    pairs = read_pairs("raw/intf.in")
+    if not pairs:
+        fail("no pairs within the thresholds: increase --max-days / --max-bperp")
+    used = {d for p in pairs for d in p}
+    unused = [s for s in stems if s not in used]
+    comps = components(sorted(used), pairs)
+    log(f"{len(pairs)} pairs over {len(used)} of {len(stems)} dates; network plot raw/baseline.pdf")
+    if unused:
+        log(f"  WARNING: {len(unused)} date(s) in no pair (not processed): {', '.join(unused)}")
+    if master_stem not in used:
+        log(f"  WARNING: the master {master_stem} is in no pair")
+    if len(comps) > 1:
+        msg = (f"the network falls into {len(comps)} disconnected parts: "
+               + "; ".join(f"{c[0]}..{c[-1]} ({len(c)} dates)" for c in comps))
+        if not a.no_iono:
+            fail(msg + ". The ionosphere step needs one connected network: increase --max-days / "
+                 "--max-bperp (or use --no-iono)")
+        log("  WARNING: " + msg)
+    if stop("pairs"):
+        return
+
+    # ---- intf -----------------------------------------------------------------
+    banner("intf", "batch_processing step 4")
+    final = "unwrap_ll.grd" if float(cfg_get(CONFIG, "threshold_snaphu", "0") or 0) != 0 else "phasefilt_ll.grd"
+    if final == "phasefilt_ll.grd" and not a.no_iono:
+        fail("threshold_snaphu = 0 (no unwrapping), but the ionosphere step needs unwrap.grd: "
+             "--set threshold_snaphu=0.1 or use --no-iono")
+    subs = [f"{pair_id(case, r)}_{pair_id(case, p)}" for r, p in pairs]
+
+    def intf_missing():
+        return [s for s in subs if not os.path.isfile(f"intf/{s}/{final}")]
+    if not intf_missing():
+        log(f"already done: every pair has intf/<pair>/{final}")
+        status("already done, skipped")
+    else:
+        if int(cfg_get(CONFIG, "intf_skip_existing", "0") or 0) != 1 and os.path.isdir("intf"):
+            log("  note: intf_skip_existing is not 1, so existing pairs are rebuilt too")
+        sh(f"{bp} raw/intf.in 4 {CONFIG}")
+        miss = intf_missing()
+        if miss:
+            fail(f"{len(miss)} pair(s) have no intf/<pair>/{final} after step 4: {', '.join(miss[:8])}"
+                 + (" ..." if len(miss) > 8 else ""))
+    if stop("intf"):
+        return
+
+    # ---- iono -----------------------------------------------------------------
+    method = cfg_get(CONFIG, "iono_method", "network") or "network"
+    iono_dir = "intf_iono_sbas" if method == "sbas" else "intf_iono"
+    if a.no_iono:
+        log("\niono: skipped (--no-iono)")
+    else:
+        banner("iono", f"batch_processing step 7 (iono_method = {method})")
+        sh(f"{bp} raw/intf.in 7 {CONFIG}")
+        miss = [s for s in subs if not os.path.isfile(f"{iono_dir}/{s}/unwrap.grd")]
+        if miss:
+            fail(f"{len(miss)} pair(s) have no {iono_dir}/<pair>/unwrap.grd after step 7: "
+                 + ", ".join(miss[:8]) + (" ..." if len(miss) > 8 else ""))
+    if stop("iono"):
+        return
+
+    # ---- closure --------------------------------------------------------------
+    if a.no_closure:
+        log("\nclosure: skipped (--no-closure)")
+    else:
+        banner("closure", "batch_processing step 8")
+        sh(f"{bp} raw/intf.in 8 {CONFIG}")
+        outs = sorted(glob.glob("closure_*"))
+        log("closure outputs: " + (", ".join(outs) if outs else "none (no closed loops in the network?)"))
+
+    done = (f"FINISHED {dt.datetime.now():%Y-%m-%d %H:%M:%S}. Uncorrected: intf/, "
+            + ("" if a.no_iono else f"corrected: {iono_dir}/, ") + f"log: {case}/nisar_stack_auto.log")
+    log(f"\nnisar_stack_auto {done}")
+    status(done)
+
+
+if __name__ == "__main__":
+    main()

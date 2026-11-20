@@ -19,7 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import run, grep_value, check_file_report
+from gmtsar_lib import run, grep_value, check_file_report, progress
 from geom_align_lib import nsr_resamp_command
 from iono_b_lib import build_b_grids, slc_params, check_ab_timing
 
@@ -100,6 +100,7 @@ def main():
     n = len(repeats)
     for i, a in enumerate(repeats, 1):
         print(f"working on {b_stem(a)}  [ {i} / {n} ]")
+        progress("step 7.1 align Frequency B", f"aligning {b_stem(a)} to {mB}", i, n)
         _align_one_B(master, a, mB, b_stem(a))
         _verify(mB, b_stem(a))
     run("rm -f *.PRM0 *resamp r.grd a.grd")

@@ -296,8 +296,11 @@ def main():
           + (f"{'|c|>.5':>8}" if unit == "rad" else f"{'unit':>6}")
           + (f"{'slip%':>7}" if (not wrapped and unit == "rad") else ""))
     nan = float("nan")
-    for loop in loops:
+    for li, loop in enumerate(loops, 1):
         tag = f"{label_d(loop[0])}->{label_d(loop[1])}->{label_d(loop[2])}"
+        # same format as gmtsar_lib.progress (kept local: this script also runs standalone)
+        print(f">>> {dt.datetime.now():%Y-%m-%d %H:%M:%S} | step 8 closure | [{li}/{len(loops)}] "
+              f"{product}: loop {tag}", flush=True)
         results, names = [], None
         try:
             target = loop_target(sets, loop, product)

@@ -47,7 +47,7 @@ import os
 import subprocess
 import sys
 
-from gmtsar_lib import run
+from gmtsar_lib import run, progress
 
 
 def _nsr_stem(h5_basename, band):
@@ -118,7 +118,10 @@ def pre_proc_batch_nsr():
 
     print(f"band {band}\nSTART PREPROCESS A STACK OF NISAR IMAGES\n")
 
+    N = 1 + len(repeat_names)
     print(f"preprocess master granule {master_name}")
+    progress("step 1 preprocess", f"master granule {master_name} -> {_nsr_stem(master_name, band)} "
+             "(both bands)", 1, N)
     if not os.path.isfile(f"{master_name}.h5"):
         sys.exit(f"missing input: {master_name}.h5 (expected in cwd — run from raw/)")
     run(f"pre_proc_nsr {master_name}.h5 {config}")
@@ -129,8 +132,10 @@ def pre_proc_batch_nsr():
                    "baseline_table.dat", "table.gmt", append=False)
 
     stems = [master_stem]
-    for repeat_name in repeat_names:
+    for k, repeat_name in enumerate(repeat_names, 2):
         print(f"preprocess repeat granule {repeat_name}")
+        progress("step 1 preprocess", f"repeat granule {repeat_name} -> {_nsr_stem(repeat_name, band)} "
+                 "(both bands)", k, N)
         if not os.path.isfile(f"{repeat_name}.h5"):
             sys.exit(f"missing input: {repeat_name}.h5 (expected in cwd — run from raw/)")
         run(f"pre_proc_nsr {repeat_name}.h5 {config}")
@@ -141,6 +146,7 @@ def pre_proc_batch_nsr():
                        "baseline_table.dat", "table.gmt", append=True)
         stems.append(repeat_stem)
 
+    progress("step 1 preprocess", "baseline table and plot")
     _plot_baseline()
 
     with open("stem_data.in", "w") as f:

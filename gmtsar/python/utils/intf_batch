@@ -14,7 +14,10 @@ import os
 import subprocess
 import sys
 
-from gmtsar_lib import run, grep_value, check_file_report, file_shuttle, replace_strings
+from gmtsar_lib import run, grep_value, check_file_report, file_shuttle, replace_strings, progress
+
+_STEP = "step 4 interferograms"
+_POS = (None, None)          # (k, n) of the pair being processed, for progress lines
 
 
 _SUPPORTED_SATS = {"ALOS", "ENVI", "ERS", "ENVI_SLC", "TSX", "NSR_A", "NSR_B"}
@@ -24,6 +27,12 @@ def _get_config(path, key, default=""):
     """grep <key> <path> | awk '{print $3}'."""
     with open(path) as f:
         for line in f:
+            # Real bug 2026-11-12: a pop_config COMMENT line that merely
+            # mentioned "reuse_topo" matched this substring test and its 3rd
+            # word ("a") was returned as the value -> int() ValueError.
+            # Comment lines never set values.
+            if line.lstrip().startswith("#"):
+                continue
             if key in line:
                 parts = line.split()
                 if len(parts) >= 3:
@@ -102,6 +111,7 @@ def _topo_stage(master, SAT, topo_phase, shift_topo, reuse_topo=0):
         sys.exit(f"Wrong parameter: topo_phase {topo_phase}")
 
     print("DEM2TOPOPHASE - START")
+    progress(_STEP, "topography in radar coordinates (dem2topo_ra; slow on the first run)")
     os.chdir("topo")
     # Real bug found 2026-09-29 on real NISAR_CSAF data: reuse_topo=1
     # still remade trans.dat on every run, even when nothing had actually
@@ -293,6 +303,7 @@ def _iono_one_pair(case_root, ref, rep, sub, dec, new_incx, new_incy,
     code, only checked with a standalone mock test (see
     bin_py/tests/test_intf_batch_iono.py)."""
     print(f"\nIONO PHASE ESTIMATE - START (pair {sub})")
+    progress(_STEP, f"pair {sub}: split-spectrum ionosphere estimate", *_POS)
     intf_sub = os.path.join(case_root, "intf", sub)
     iono_dir = os.path.join(intf_sub, "iono_phase")
     if os.path.isdir(iono_dir):
@@ -406,6 +417,7 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
     sub = f"{ref_id}_{rep_id}"
 
     print(f"\nINTF + FILTER - START (pair {sub})")
+    progress(_STEP, f"pair {sub} ({ref}:{rep}): interferogram + filter", *_POS)
     os.chdir("intf")
     os.makedirs(sub, exist_ok=True)
     os.chdir(sub)
@@ -462,6 +474,7 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
             os.chdir(f"../intf/{sub}")
             run("ln -sf ../../topo/landmask_ra.grd .")
         print(f"\nSNAPHU - START (threshold {threshold_snaphu})")
+        progress(_STEP, f"pair {sub}: unwrapping (snaphu, threshold {threshold_snaphu})", *_POS)
         interp_flag = 1 if near_interp == 1 else 0
         # Real bug found 2026-10-19 (first geocoded NISAR stack): this called
         # bare `snaphu`, which on PATH is the real snaphu C binary (built from
@@ -476,6 +489,7 @@ def _intf_one_pair(ref, rep, filter_wavelen, dec, topo_phase, shift_topo,
         print("SKIP UNWRAP PHASE")
 
     print("\nGEOCODE - START")
+    progress(_STEP, f"pair {sub}: geocoding", *_POS)
     run("rm -f raln.grd ralt.grd")
     if topo_phase != 1:
         sys.exit("topo_ra is needed to geocode")
@@ -580,14 +594,17 @@ def intf_batch():
             for stem in scenes:
                 _iono_split_scene(case_root, stem)
 
-        for line in pairs:
+        global _POS
+        for k, line in enumerate(pairs, 1):
             ref, rep = line.split(":", 1)
+            _POS = (k, len(pairs))
             if skip_existing:
                 ref_id = int(float(grep_value(f"./SLC/{ref}.PRM", "SC_clock_start", 3)))
                 rep_id = int(float(grep_value(f"./SLC/{rep}.PRM", "SC_clock_start", 3)))
                 if _pair_finished(f"{ref_id}_{rep_id}", threshold_snaphu):
                     print(f"INTF: pair {ref_id}_{rep_id} already complete -- skipping "
                           "(intf_skip_existing = 1)")
+                    progress(_STEP, f"pair {ref_id}_{rep_id}: already complete, skipped", k, len(pairs))
                     continue
             _intf_one_pair(
                 ref, rep, filter_wavelen, dec, topo_phase, shift_topo,

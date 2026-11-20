@@ -28,7 +28,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import run, grep_value
+from gmtsar_lib import run, grep_value, progress
 from iono_b_lib import slc_params
 from iono_est_lib import (band_ratio, dispersive_estimate, n_eff_gaussian,
                           block_mean_phasor, unwrap_via_coarse, unwrap_from_reference)
@@ -159,6 +159,7 @@ def main():
         out = f"iono_est{'_' + a.tag if a.tag else ''}/{sub}"
         if os.path.isfile(f"{out}/I.grd"):
             print(f"[{i}/{len(pairs)}] {sub}: exists, skipped")
+            progress("step 7.4 per-pair estimates", f"pair {sub}: exists, skipped", i, len(pairs))
             continue
         need = [f"iono_A/{sub}/phase.grd", f"iono_A/{sub}/corr.grd",
                 f"iono_B/{sub}/phase.grd", f"iono_B/{sub}/corr.grd"]
@@ -166,6 +167,7 @@ def main():
         if miss:
             sys.exit(f"missing {miss}")
         print(f"[{i}/{len(pairs)}] {sub}: unwrapping A")
+        progress("step 7.4 per-pair estimates", f"pair {sub} ({ref}:{rep}): dispersive estimate", i, len(pairs))
         ref_path = f"intf/{sub}/unwrap.grd"
         use_a = (a.unw_source == "A"
                  or (a.unw_source == "auto" and os.path.isfile(ref_path)))

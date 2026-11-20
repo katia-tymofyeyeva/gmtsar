@@ -31,7 +31,7 @@ See geom_align_lib.py / docs/PATHWAY_FORWARD.md.
 import os
 import sys
 
-from gmtsar_lib import run, grep_value, check_file_report
+from gmtsar_lib import run, grep_value, check_file_report, progress
 from geom_align_lib import fit_alignment_grids, nsr_resamp_command
 
 _CONFIG = None  # set in align_batch_nsr() from optional 2nd argv
@@ -191,6 +191,7 @@ def align_batch_nsr():
     n = len(repeats)
     for i, aligned in enumerate(repeats, start=1):
         print(f"working on {aligned}  [ {i} / {n} ]")
+        progress("step 2 align", f"aligning {aligned} to {master}", i, n)
         _align_one(master, aligned)
         _verify_aligned(master, aligned)
 

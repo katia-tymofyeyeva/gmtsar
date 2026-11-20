@@ -268,6 +268,16 @@ def assign_arg(arg, str):
     else:
        return 0
 
+def progress(step, msg, i=None, n=None):
+    """One progress line, easy to find in a log:
+        >>> 2026-11-20 14:03:12 | step 4 interferograms | [12/66] pair 2026058_2026094: unwrapping
+    `grep '>>>' logfile | tail -1` (or the status file written by nisar_stack_auto)
+    shows what the processing is doing right now."""
+    import datetime as _dt
+    count = f"[{i}/{n}] " if i is not None and n is not None else ""
+    print(f">>> {_dt.datetime.now():%Y-%m-%d %H:%M:%S} | {step} | {count}{msg}", flush=True)
+
+
 def run(cmd):
     """Run a shell command. Non-zero exit prints a WARN to stderr but does
     NOT raise — gmtsar binaries exit non-zero for benign reasons (warnings,

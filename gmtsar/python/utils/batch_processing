@@ -50,7 +50,7 @@ Notes:
 import os
 import sys
 
-from gmtsar_lib import run
+from gmtsar_lib import run, progress
 
 
 _SUPPORTED_SATS = {
@@ -120,6 +120,7 @@ def batch_processing():
 
     if step == 1:
         print(f"batch_processing: step 1 — preprocessing")
+        progress("batch_processing", "step 1 (preprocessing) started")
         if SAT in ("NSR_A", "NSR_B"):
             band = SAT[-1]  # "A" or "B"
             if not os.path.isdir("raw"):
@@ -132,6 +133,7 @@ def batch_processing():
             run(f"pre_proc_batch {SAT} {inputfile} {config}")
     elif step == 2:
         print(f"batch_processing: step 2 — alignment")
+        progress("batch_processing", "step 2 (alignment) started")
         if SAT in ("NSR_A", "NSR_B"):
             stem_data_in = os.path.join("raw", "stem_data.in")
             if not os.path.isfile(stem_data_in):
@@ -146,9 +148,11 @@ def batch_processing():
             run(f"align_batch {data_type} {secondary} {inputfile}")
     elif step == 4:
         print(f"batch_processing: step 4 — interferometry")
+        progress("batch_processing", "step 4 (interferometry) started")
         run(f"intf_batch {SAT} {inputfile} {config}")
     elif step == 7:
         print("batch_processing: step 7 — ionosphere correction (Frequency B)")
+        progress("batch_processing", "step 7 (ionosphere correction) started")
         if SAT != "NSR_A":
             sys.exit("[ERROR]: step 7 (ionosphere correction with Frequency B) is NISAR only: use SAT NSR_A")
         if not os.path.isdir("intf"):
@@ -156,9 +160,12 @@ def batch_processing():
         run(f"iono_workflow {inputfile} {config}")
     elif step == 8:
         print("batch_processing: step 8 — phase-closure check (reads existing products only)")
+        progress("batch_processing", "step 8 (phase-closure check) started")
         if not (os.path.isdir("intf") or os.path.isdir("intf_iono")):
             sys.exit("[ERROR]: neither intf/ nor intf_iono/ found — run step 4 (and 7) first")
-        for cmd in closure_commands(config):
+        cmds = closure_commands(config)
+        for k, cmd in enumerate(cmds, 1):
+            progress("step 8 closure", f"product {cmd.split()[1]}", k, len(cmds))
             run(cmd)
     elif step in (3, 5, 6):
         sys.exit(

@@ -57,7 +57,9 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import run, grep_value
+from gmtsar_lib import run, grep_value, progress
+
+STEP = "step 7.5 screens + correction"
 from iono_b_lib import slc_params, azimuth_pixel_m
 from iono_est_lib import wrap
 from iono_net_lib import (block_reduce, solve_network, filter_screen, interp_to_grid,
@@ -255,6 +257,7 @@ def sbas_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, scr_dir
             if Ik.shape != (ny, nx) or not (np.array_equal(xk, x) and np.array_equal(yk, y)):
                 sys.exit(f"{f_i}: grid differs from {subs[0]}'s")
             sg = read_gmt_grd(f_s)[0]
+            progress(STEP, f"sbas: filtering pair {sub}", k + 1, P)
             try:
                 stI[k], stS[k], inl = filter_screen(Ik, sg, sy, sx, posterior_sigma=True)
             except ValueError as e:
@@ -280,6 +283,7 @@ def sbas_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, scr_dir
     # ---- 2. pair datums from a subsample of the whole image
     st = max(1, a.datum_stride)
     t0 = time.time()
+    progress(STEP, f"sbas: pair datums from a 1/{st} x 1/{st} subsample")
     sub_net = solve_network(pairs, np.asarray(stI[:, ::st, ::st]), np.asarray(stS[:, ::st, ::st]),
                             D, gauge, require_connected=True)
     datum = sub_net["c"]
@@ -313,6 +317,8 @@ def sbas_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, scr_dir
             done_rows += r1 - r0
             if time.time() - last > 30 or done_rows == ny:
                 el = time.time() - t0
+                progress(STEP, f"sbas: full-resolution inversion, rows {done_rows}/{ny} "
+                         f"(~{el * (ny - done_rows) / max(done_rows, 1) / 60:.0f} min left)")
                 print(f"   rows {done_rows}/{ny}  ({el:.0f} s, "
                       f"~{el * (ny - done_rows) / max(done_rows, 1):.0f} s left)", flush=True)
                 last = time.time()
@@ -365,6 +371,7 @@ def network_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, wl, 
             f_i, f_s = f"iono_est/{sub}/I.grd", f"iono_est/{sub}/sigma.grd"
             if not (os.path.isfile(f_i) and os.path.isfile(f_s)):
                 sys.exit(f"missing {f_i} / {f_s}: run iono_pair_estimate for every pair first")
+            progress(STEP, f"network: block-averaging pair {sub}", k + 1, P)
             I, x, y, info = read_gmt_grd(f_i)
             sg = read_gmt_grd(f_s)[0]
             cell_x_m = pb["dr"] * info["x_inc"] / sin_inc
@@ -391,6 +398,7 @@ def network_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, wl, 
 
     # ------------------------------------------------------- 2. invert ---
     t0 = time.time()
+    progress(STEP, f"network: inverting {P} pairs for {D} per-date screens (coarse grid)")
     net = solve_network(pairs, c["Ib"], c["sb"], D, gauge)
     print(f"network inversion done in {time.time() - t0:.0f} s")
     print_qc(net["qc"], dates, P, D)
@@ -407,6 +415,7 @@ def network_screens(a, pairs, subs, dates, gauge, ratio, pb, az_m, sin_inc, wl, 
     for d in range(D):
         if d == gauge:
             continue
+        progress(STEP, f"network: filtering the screen of {dates[d]}", d + 1, D)
         try:
             Sf[d], Sg[d], _ = filter_screen(net["S"][d], net["sigma_S"][d], sy, sx)
         except ValueError as e:
@@ -434,12 +443,14 @@ def apply_corrections(a, pairs, subs, Sf, xc, yc, out_root, thr_geo):
         src, out = f"intf/{sub}", f"{out_root}/{sub}"
         if os.path.isfile(f"{out}/unwrap_ll.grd") and not a.force:
             print(f"[{k}/{P}] {sub}: exists, skipped")
+            progress(STEP, f"correcting pair {sub}: exists, skipped", k, P)
             continue
         need = [f"{src}/{n}" for n in ("unwrap.grd", "phasefilt.grd", "phase.grd", "corr.grd")]
         miss = [p for p in need if not os.path.isfile(p)]
         if miss:
             sys.exit(f"missing {miss}: needs the step-4 products of {sub}")
         print(f"[{k}/{P}] {sub}: correcting")
+        progress(STEP, f"correcting pair {sub} -> {out}/", k, P)
         unw, xt, yt, uinfo = read_gmt_grd(f"{src}/unwrap.grd")
         corr = interp_to_grid(np.asarray(Sf[i]) - np.asarray(Sf[j]), xc, yc, xt, yt)
         if np.isnan(corr).any():
@@ -483,6 +494,7 @@ def apply_corrections(a, pairs, subs, Sf, xc, yc, out_root, thr_geo):
                 os.chdir(out)
                 run("rm -f raln.grd ralt.grd trans.dat")
                 run("ln -sf ../../topo/trans.dat .")
+                progress(STEP, f"geocoding corrected pair {sub}", k, P)
                 run(f"geocode {thr_geo}")
                 miss = [f for f in ("unwrap_ll.grd", "phasefilt_ll.grd", "ph_iono_ll.grd", "los_ll.grd")
                         if not os.path.isfile(f)]

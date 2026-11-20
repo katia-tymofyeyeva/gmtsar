@@ -1,5 +1,16 @@
 # Pathway forward — what's ported, what's not, and why
 
+## Built 2026-11-20: `nisar_stack_auto` — whole NISAR batch workflow in one command — stub-tested only
+
+`nisar_stack_auto RAW_DIR MASTER_GRANULE --max-days D --max-bperp B [--set key=value ...]` runs, from `<case>/raw/*.h5`: data.in (master first) → `pop_config NSR_A > config.NSR_A.txt` (first run: see auto defaults below) → DEM (union of granule footprints + 0.2° → `make_dem` in topo/; or `--dem FILE` / `--region W/E/S/N`) → `batch_processing` step 1 → `master_image` set from the first line of `raw/stem_data.in` → step 2 → `select_pairs` in raw/ with thresholds + 1e-3 (select_pairs keeps pairs strictly below them; the user's limits are inclusive) → connectivity check (stops before step 4 if the network is in several parts, since step 7 needs one; warns about dates in no pair or a master in no pair) → step 4 → step 7 → step 8.
+
+- Each stage is skipped if its outputs exist, so a rerun resumes; and each is checked by its outputs afterwards, because `batch_processing`'s inner `run()` only warns on failure (exit code 0 even when a step failed). Log: `<case>/nisar_stack_auto.log`.
+- `--region` / `--set` values starting with "-" (western longitudes) are glued to the option before argparse.
+- Footprints: `identification/boundingPolygon`, else `RSLC/metadata/geolocationGrid/coordinateX/Y` (EPSG 4326). Both paths are from the NISAR product layout as I know it, not checked on a granule; on failure the run stops and asks for `--region`.
+- Progress reporting (added the same day): `gmtsar_lib.progress(step, msg, i, n)` prints one line `>>> <time> | <step> | [i/n] <msg>`; called in every per-scene / per-pair loop of steps 1, 2, 4, 7 (stages 7.1-7.5, incl. sbas inversion row progress with time left) and 8 (per loop, local copy in `check_closure`), and at each `batch_processing` step start. `nisar_stack_auto` writes its own stage lines in the same format and keeps `<case>/nisar_stack_auto.status` rewritten with the current stage and the latest `>>>` line (STOPPED / FINISHED at the end). `grep '>>>' nisar_stack_auto.log | tail` gives the history.
+- Auto defaults on a NEW config (user request): `threshold_snaphu = 0.1`, `near_interp = 1` (snaphu with nearest-neighbour filling of low-coherence holes), `intf_skip_existing = 1`; `--set` overrides them; pop_config's own defaults unchanged.
+- Tests: `test_nisar_stack_auto.py` (7, stub commands on PATH that create the files each real step leaves): stage order and arguments, master_image, inclusive thresholds, config defaults, resume runs only steps 7/8, step without output stops, disconnected network stops (or warns with `--no-iono`), unused-date warnings, negative-longitude `--region`, `--stop-after`.
+
 ## Built 2026-11-18: SBAS-like full-resolution ionosphere screens (`iono_method = sbas`) — synthetic tests only
 
 Variant of stages 3-4 of the Frequency-B workflow, settled with the user the same day after two revisions: **filter each pair's raw estimate, then invert the filtered estimates at full resolution; the screens are not filtered again.** Stages 1-2 (per-pair estimates) and stage 5 (correction = S(ref) − S(rep), subtract, geocode) unchanged, so closure is still preserved. Default stays `network`.

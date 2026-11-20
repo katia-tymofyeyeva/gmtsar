@@ -34,7 +34,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gmtsar_lib import grep_value
+from gmtsar_lib import grep_value, progress
 
 
 def _cfg(path, key, default=""):
@@ -90,12 +90,18 @@ def main():
     subs = [f"{pid(r)}_{pid(p)}" for r, p in pairs]
     bstem = lambda s: s[:-1] + "B"
 
+    names = {1: "align Frequency B (SLC_B/)", 2: "B interferograms (iono_B/)",
+             3: "A on the B grid (iono_A/)", 4: "per-pair estimates (iono_est/)",
+             5: "screens + corrected pairs"}
+
     def todo(n, done):
         if n < a.from_step or n > a.stop_after:
             return False
         if done:
             print(f"step {n}: already complete, skipped")
+            progress("step 7 ionosphere", f"stage {n}/5 {names[n]}: already complete, skipped")
             return False
+        progress("step 7 ionosphere", f"stage {n}/5 {names[n]}: starting")
         return True
 
     # 1
@@ -118,6 +124,7 @@ def main():
         sh(["iono_pair_estimate", a.intf_in, a.config] + shlex.split(a.est_args))
     # 5 (always cheap to rerun: it caches the coarse estimates; --force-style reruns via --correct-args)
     if a.from_step <= 5 <= a.stop_after:
+        progress("step 7 ionosphere", f"stage 5/5 {names[5]}: starting")
         sh(["iono_correct_stack", a.intf_in, a.config] + shlex.split(a.correct_args))
     print("\niono_workflow: done")
 
